@@ -1,0 +1,14 @@
+node_modules/
+dist/
+
+# Credentials — never commit OAuth keys or tokens
+credentials/gcp-oauth.keys.json
+credentials/.gdrive-server-credentials.json
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
