@@ -31,9 +31,24 @@ describe("buildSearchQuery", () => {
     );
   });
 
+  it("treats text with Drive keywords but no operators as plain text", () => {
+    expect(buildSearchQuery("parents meeting notes")).toBe(
+      "fullText contains 'parents meeting notes' and trashed = false",
+    );
+    expect(buildSearchQuery("name ideas for project")).toBe(
+      "fullText contains 'name ideas for project' and trashed = false",
+    );
+  });
+
   it("passes Drive query syntax through unchanged", () => {
     expect(buildSearchQuery("name contains 'budget'")).toBe(
       "name contains 'budget' and trashed = false",
+    );
+  });
+
+  it("wraps or-queries in parens before appending trashed filter", () => {
+    expect(buildSearchQuery("mimeType='application/pdf' or mimeType='text/plain'")).toBe(
+      "(mimeType='application/pdf' or mimeType='text/plain') and trashed = false",
     );
   });
 

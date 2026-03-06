@@ -89,9 +89,13 @@ export async function runAuthFlow(): Promise<OAuth2Client> {
     keyfilePath,
   });
 
-  if (client.credentials) {
-    await saveCredentials(client);
+  if (!client.credentials?.refresh_token) {
+    throw new Error(
+      "No refresh token received from Google. This can happen when re-authorizing.\n" +
+        "Revoke access at https://myaccount.google.com/permissions and try again.",
+    );
   }
+  await saveCredentials(client);
 
   return client;
 }

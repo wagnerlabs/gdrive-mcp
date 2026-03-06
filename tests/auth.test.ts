@@ -76,3 +76,28 @@ describe("loadCredentials", () => {
     await expect(loadCredentials()).rejects.toThrow(/gdrive-mcp auth/);
   });
 });
+
+describe("runAuthFlow", () => {
+  beforeEach(() => {
+    vi.resetModules();
+    delete process.env.GDRIVE_CREDENTIALS_PATH;
+    delete process.env.GDRIVE_OAUTH_PATH;
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("throws when no refresh token is returned", async () => {
+    const { authenticate } = await import("@google-cloud/local-auth");
+    vi.mocked(authenticate).mockResolvedValue({
+      credentials: { access_token: "at" },
+    } as any);
+    vi.mocked(fs.access).mockResolvedValue(undefined);
+
+    const { runAuthFlow } = await import("../src/auth.js");
+
+    await expect(runAuthFlow()).rejects.toThrow(/No refresh token/);
+    await expect(runAuthFlow()).rejects.toThrow(/myaccount.google.com/);
+  });
+});

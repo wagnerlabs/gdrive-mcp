@@ -92,14 +92,16 @@ function isTextMime(mimeType: string): boolean {
 }
 
 const DRIVE_QUERY_PATTERN =
-  /\b(contains|fullText|name|mimeType|modifiedTime|createdTime|trashed|starred|parents|owners|writers|readers|sharedWithMe)\b|[!=<>]/;
+  /\b(fullText|name|mimeType|modifiedTime|createdTime|trashed|starred|parents|owners|writers|readers|sharedWithMe)\s*(contains|=|!=|<|>|<=|>=|\b(in|has)\b)/;
 
 export function buildSearchQuery(userQuery: string): string {
-  const q = DRIVE_QUERY_PATTERN.test(userQuery)
+  const isDriveQuery = DRIVE_QUERY_PATTERN.test(userQuery);
+  const q = isDriveQuery
     ? userQuery
     : `fullText contains '${userQuery.replace(/\\/g, "\\\\").replace(/'/g, "\\'")}'`;
   if (/\btrashed\b/i.test(q)) return q;
-  return `${q} and trashed = false`;
+  const wrapped = isDriveQuery && /\bor\b/i.test(q) ? `(${q})` : q;
+  return `${wrapped} and trashed = false`;
 }
 
 function handleApiError(err: unknown): never {
