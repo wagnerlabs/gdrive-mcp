@@ -38,9 +38,9 @@ npm run build
    - Application type: **Desktop app**
    - Name: `gdrive-mcp` (this is just a console label to help you identify this client later)
    - Click **Create**
-   - Download the JSON file and save it as:
+   - Download the JSON file and save it to the `credentials/` folder at the root of this repo:
      ```
-     credentials/gcp-oauth.keys.json
+     gdrive-mcp/credentials/gcp-oauth.keys.json
      ```
 
 ### 3. Authenticate
