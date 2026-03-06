@@ -5,6 +5,10 @@ dist/
 credentials/gcp-oauth.keys.json
 credentials/.gdrive-server-credentials.json
 
+# Environment
+.env
+.env.*
+
 # IDE
 .vscode/
 .idea/
