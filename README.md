@@ -9,7 +9,7 @@ Search, list, and read files — including automatic export of Google Docs (as M
 ### 1. Install
 
 ```bash
-git clone https://github.com/<you>/gdrive-mcp.git
+git clone https://github.com/wagnerlabs/gdrive-mcp.git
 cd gdrive-mcp
 npm install
 npm run build
@@ -18,20 +18,26 @@ npm run build
 ### 2. Set up Google Cloud credentials
 
 1. Go to [Google Cloud Console](https://console.cloud.google.com/)
-2. Create a project (or select an existing one)
+2. Create a project (e.g. `gdrive-mcp`) or select an existing one
 3. **Enable the Google Drive API**
    - Navigate to *APIs & Services > Library*
    - Search for "Google Drive API" and click **Enable**
 4. **Configure the OAuth consent screen**
-   - Navigate to *APIs & Services > OAuth consent screen*
-   - Choose *External* user type (unless you have a Workspace org)
-   - Fill in the required fields (app name, support email, contact email)
-   - Add scope: `https://www.googleapis.com/auth/drive.readonly`
+   - Navigate to *APIs & Services > OAuth consent screen* and click **Get started**
+   - Enter an app name (e.g. `gdrive-mcp`), select your email as the support email, and click **Next**
+   - **Audience**: select *Internal* (Workspace users) or *External* (personal Gmail), then click **Next**
+   - **Contact Information**: enter your email and click **Next**
+   - **Finish**: check the policy agreement box and click **Create**
+5. **Add the Drive scope**
+   - In the left sidebar, go to *Data Access*
+   - Click **Add or remove scopes**
+   - Add: `https://www.googleapis.com/auth/drive.readonly`
    - Save
-5. **Create OAuth credentials**
-   - Navigate to *APIs & Services > Credentials*
-   - Click *Create Credentials > OAuth client ID*
+6. **Create OAuth credentials**
+   - In the left sidebar, go to *Clients* and click **Create Client**
    - Application type: **Desktop app**
+   - Name: `gdrive-mcp` (this is just a console label to help you identify this client later)
+   - Click **Create**
    - Download the JSON file and save it as:
      ```
      credentials/gcp-oauth.keys.json
