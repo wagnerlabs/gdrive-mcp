@@ -56,7 +56,15 @@ A browser window will open for Google sign-in. After approval the token is saved
 #### Claude Code CLI
 
 ```bash
-claude mcp add gdrive -- node /absolute/path/to/gdrive-mcp/dist/index.js
+claude mcp add --scope user wagnerlabs-gdrive -- node /absolute/path/to/gdrive-mcp/dist/index.js
+```
+
+The `--scope user` flag installs the server globally, so the MCP server will be available in Claude Code as **wagnerlabs-gdrive** from any directory you run Claude Code in.
+
+To remove:
+
+```bash
+claude mcp remove wagnerlabs-gdrive
 ```
 
 #### Cursor
