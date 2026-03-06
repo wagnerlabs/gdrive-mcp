@@ -122,6 +122,17 @@ Credential paths can be customized via environment variables:
 | `GDRIVE_OAUTH_PATH` | `credentials/gcp-oauth.keys.json` | Path to OAuth client secret |
 | `GDRIVE_CREDENTIALS_PATH` | `credentials/.gdrive-server-credentials.json` | Path to saved token |
 
+## Updating
+
+After pulling new changes, rebuild and the MCP server will pick up the update on next launch — no need to re-register it:
+
+```bash
+cd /path/to/gdrive-mcp
+git pull
+npm install
+npm run build
+```
+
 ## Development
 
 ```bash
