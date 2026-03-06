@@ -3,7 +3,7 @@ import { OAuth2Client } from "google-auth-library";
 import { GaxiosError } from "gaxios";
 
 const FILE_FIELDS =
-  "id, name, mimeType, size, modifiedTime, createdTime, owners, parents, webViewLink, description, starred, trashed";
+  "id, name, mimeType, size, modifiedTime, createdTime, owners, parents, webViewLink, description, starred, trashed, shortcutDetails(targetId, targetMimeType)";
 
 const LIST_FIELDS = `nextPageToken, files(${FILE_FIELDS})`;
 
@@ -57,10 +57,11 @@ export interface FileSummary {
   description?: string;
   starred?: boolean;
   trashed?: boolean;
+  shortcutTarget?: { id: string; mimeType: string };
 }
 
 function formatFile(file: drive_v3.Schema$File): FileSummary {
-  return {
+  const summary: FileSummary = {
     id: file.id!,
     name: file.name!,
     mimeType: file.mimeType!,
@@ -77,10 +78,28 @@ function formatFile(file: drive_v3.Schema$File): FileSummary {
     starred: file.starred ?? undefined,
     trashed: file.trashed ?? undefined,
   };
+  if (file.shortcutDetails?.targetId) {
+    summary.shortcutTarget = {
+      id: file.shortcutDetails.targetId,
+      mimeType: file.shortcutDetails.targetMimeType!,
+    };
+  }
+  return summary;
 }
 
 function isTextMime(mimeType: string): boolean {
   return TEXT_MIME_PREFIXES.some((prefix) => mimeType.startsWith(prefix));
+}
+
+const DRIVE_QUERY_PATTERN =
+  /\b(contains|fullText|name|mimeType|modifiedTime|createdTime|trashed|starred|parents|owners|writers|readers|sharedWithMe)\b|[!=<>]/;
+
+export function buildSearchQuery(userQuery: string): string {
+  const q = DRIVE_QUERY_PATTERN.test(userQuery)
+    ? userQuery
+    : `fullText contains '${userQuery.replace(/\\/g, "\\\\").replace(/'/g, "\\'")}'`;
+  if (/\btrashed\b/i.test(q)) return q;
+  return `${q} and trashed = false`;
 }
 
 function handleApiError(err: unknown): never {
@@ -109,7 +128,7 @@ export class DriveClient {
   ): Promise<{ files: FileSummary[]; nextPageToken?: string }> {
     try {
       const res = await this.drive.files.list({
-        q: query,
+        q: buildSearchQuery(query),
         pageSize: maxResults,
         pageToken: pageToken,
         fields: LIST_FIELDS,
@@ -143,6 +162,16 @@ export class DriveClient {
     maxChars: number = 100_000,
   ): Promise<{ content: string; mimeType: string; truncated: boolean }> {
     const meta = await this.getFile(fileId);
+
+    if (meta.mimeType === "application/vnd.google-apps.shortcut") {
+      if (!meta.shortcutTarget) {
+        throw new DriveAPIError(
+          "Shortcut target not available. Use gdrive_get_file for metadata.",
+        );
+      }
+      return this.readFile(meta.shortcutTarget.id, maxChars);
+    }
+
     const exportMime = GOOGLE_EXPORT_MAP[meta.mimeType];
 
     if (exportMime) {
@@ -163,7 +192,7 @@ export class DriveClient {
     folderId: string = "root",
     maxResults: number = 50,
     pageToken?: string,
-    orderBy: string = "folder,modifiedTime desc",
+    orderBy: string = "modifiedTime desc",
   ): Promise<{ files: FileSummary[]; nextPageToken?: string }> {
     try {
       const res = await this.drive.files.list({

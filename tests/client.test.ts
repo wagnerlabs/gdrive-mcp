@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { DriveClient, DriveAPIError } from "../src/client.js";
+import { DriveClient, DriveAPIError, buildSearchQuery } from "../src/client.js";
 
 function makeMockDrive(overrides: Record<string, unknown> = {}) {
   return {
@@ -17,6 +17,36 @@ function makeClient(mockDrive: ReturnType<typeof makeMockDrive>): DriveClient {
   (client as any).drive = mockDrive;
   return client;
 }
+
+describe("buildSearchQuery", () => {
+  it("wraps plain text in fullText contains", () => {
+    expect(buildSearchQuery("quarterly report")).toBe(
+      "fullText contains 'quarterly report' and trashed = false",
+    );
+  });
+
+  it("escapes single quotes in plain text", () => {
+    expect(buildSearchQuery("it's here")).toBe(
+      "fullText contains 'it\\'s here' and trashed = false",
+    );
+  });
+
+  it("passes Drive query syntax through unchanged", () => {
+    expect(buildSearchQuery("name contains 'budget'")).toBe(
+      "name contains 'budget' and trashed = false",
+    );
+  });
+
+  it("does not double-add trashed filter", () => {
+    const q = "name contains 'x' and trashed = false";
+    expect(buildSearchQuery(q)).toBe(q);
+  });
+
+  it("preserves explicit trashed = true", () => {
+    const q = "name contains 'x' and trashed = true";
+    expect(buildSearchQuery(q)).toBe(q);
+  });
+});
 
 describe("DriveClient.search", () => {
   it("returns formatted file summaries", async () => {
@@ -40,9 +70,23 @@ describe("DriveClient.search", () => {
     expect(result.nextPageToken).toBe("tok2");
     expect(mockDrive.files.list).toHaveBeenCalledWith(
       expect.objectContaining({
-        q: "test query",
+        q: "fullText contains 'test query' and trashed = false",
         supportsAllDrives: true,
         includeItemsFromAllDrives: true,
+      }),
+    );
+  });
+
+  it("passes Drive query syntax to API", async () => {
+    const mockDrive = makeMockDrive();
+    mockDrive.files.list.mockResolvedValue({ data: { files: [] } });
+    const client = makeClient(mockDrive);
+
+    await client.search("mimeType='application/pdf'");
+
+    expect(mockDrive.files.list).toHaveBeenCalledWith(
+      expect.objectContaining({
+        q: "mimeType='application/pdf' and trashed = false",
       }),
     );
   });
@@ -169,6 +213,45 @@ describe("DriveClient.readFile", () => {
   });
 });
 
+describe("DriveClient.readFile — shortcuts", () => {
+  it("follows shortcut to target file", async () => {
+    const mockDrive = makeMockDrive();
+    mockDrive.files.get
+      .mockResolvedValueOnce({
+        data: {
+          id: "shortcut1",
+          name: "My Shortcut",
+          mimeType: "application/vnd.google-apps.shortcut",
+          shortcutDetails: { targetId: "real1", targetMimeType: "application/vnd.google-apps.document" },
+        },
+      })
+      .mockResolvedValueOnce({
+        data: { id: "real1", name: "Real Doc", mimeType: "application/vnd.google-apps.document" },
+      });
+    mockDrive.files.export.mockResolvedValue({ data: "# Target content" });
+    const client = makeClient(mockDrive);
+
+    const result = await client.readFile("shortcut1");
+
+    expect(result.content).toBe("# Target content");
+    expect(result.mimeType).toBe("text/markdown");
+  });
+
+  it("throws when shortcut has no target", async () => {
+    const mockDrive = makeMockDrive();
+    mockDrive.files.get.mockResolvedValue({
+      data: {
+        id: "shortcut1",
+        name: "Broken Shortcut",
+        mimeType: "application/vnd.google-apps.shortcut",
+      },
+    });
+    const client = makeClient(mockDrive);
+
+    await expect(client.readFile("shortcut1")).rejects.toThrow(/Shortcut target/);
+  });
+});
+
 describe("DriveClient.listFiles", () => {
   it("scopes query to parent folder", async () => {
     const mockDrive = makeMockDrive();
@@ -188,7 +271,7 @@ describe("DriveClient.listFiles", () => {
     );
   });
 
-  it("defaults to root folder", async () => {
+  it("defaults to root folder with modifiedTime desc ordering", async () => {
     const mockDrive = makeMockDrive();
     mockDrive.files.list.mockResolvedValue({ data: { files: [] } });
     const client = makeClient(mockDrive);
@@ -198,6 +281,7 @@ describe("DriveClient.listFiles", () => {
     expect(mockDrive.files.list).toHaveBeenCalledWith(
       expect.objectContaining({
         q: "'root' in parents and trashed = false",
+        orderBy: "modifiedTime desc",
       }),
     );
   });

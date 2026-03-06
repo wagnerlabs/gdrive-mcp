@@ -9,14 +9,20 @@ const SAFE: ToolAnnotations = {
   openWorldHint: true,
 };
 
-function errorResult(err: unknown): { content: Array<{ type: "text"; text: string }> } {
+function errorResult(err: unknown): {
+  content: Array<{ type: "text"; text: string }>;
+  isError: true;
+} {
   const message =
     err instanceof DriveAPIError
       ? err.message
       : err instanceof Error
         ? err.message
         : String(err);
-  return { content: [{ type: "text" as const, text: `Error: ${message}` }] };
+  return {
+    content: [{ type: "text" as const, text: `Error: ${message}` }],
+    isError: true,
+  };
 }
 
 function jsonResult(data: unknown): { content: Array<{ type: "text"; text: string }> } {
@@ -128,9 +134,10 @@ export function createServer(client: DriveClient): McpServer {
         .describe("Pagination token from a previous gdrive_list_files result"),
       order_by: z
         .string()
-        .default("folder,modifiedTime desc")
+        .default("modifiedTime desc")
         .describe(
-          "Sort order (default: folders first, then by modification time descending)",
+          "Sort order (default: most recently modified first). " +
+            "Supported keys: createdTime, modifiedTime, name, quotaBytesUsed, etc.",
         ),
     },
     SAFE,

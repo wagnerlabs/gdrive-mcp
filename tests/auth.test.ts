@@ -23,7 +23,7 @@ describe("loadCredentials", () => {
     vi.restoreAllMocks();
   });
 
-  it("reads from default path when env var is not set", async () => {
+  it("reads from default path relative to project root, not cwd", async () => {
     const mockCreds = {
       type: "authorized_user",
       client_id: "id",
@@ -39,10 +39,9 @@ describe("loadCredentials", () => {
     const { loadCredentials } = await import("../src/auth.js");
     const result = await loadCredentials();
 
-    expect(fs.readFile).toHaveBeenCalledWith(
-      path.join("credentials", ".gdrive-server-credentials.json"),
-      "utf-8",
-    );
+    const calledPath = vi.mocked(fs.readFile).mock.calls[0][0] as string;
+    expect(path.isAbsolute(calledPath)).toBe(true);
+    expect(calledPath).toMatch(/credentials[/\\].gdrive-server-credentials\.json$/);
     expect(result).toBe(mockClient);
   });
 

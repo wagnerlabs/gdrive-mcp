@@ -3,11 +3,22 @@ import { google } from "googleapis";
 import { OAuth2Client } from "google-auth-library";
 import * as fs from "fs/promises";
 import * as path from "path";
+import { fileURLToPath } from "url";
 
 const SCOPES = ["https://www.googleapis.com/auth/drive.readonly"];
 
-const DEFAULT_OAUTH_PATH = path.join("credentials", "gcp-oauth.keys.json");
+const PROJECT_ROOT = path.resolve(
+  path.dirname(fileURLToPath(import.meta.url)),
+  "..",
+);
+
+const DEFAULT_OAUTH_PATH = path.join(
+  PROJECT_ROOT,
+  "credentials",
+  "gcp-oauth.keys.json",
+);
 const DEFAULT_CREDENTIALS_PATH = path.join(
+  PROJECT_ROOT,
   "credentials",
   ".gdrive-server-credentials.json",
 );
