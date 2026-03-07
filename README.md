@@ -6,59 +6,22 @@ Search, list, and read files, including automatic export of Google Docs as Markd
 
 ## Quick start
 
-### 1. Install
+### 1. Guided setup (recommended)
 
 ```bash
 git clone https://github.com/wagnerlabs/gdrive-mcp.git
 cd gdrive-mcp
 npm install
-npm run build
+npm run setup
 ```
 
-### 2. Set up Google Cloud credentials
-
-1. Go to [Google Cloud Console](https://console.cloud.google.com/)
-2. Create a project (e.g. `gdrive-mcp`) or select an existing one
-3. **Enable the Google Drive API**
-   - Navigate to *APIs & Services > Library*
-   - Search for "Google Drive API" and click **Enable**
-4. **Enable the Google Sheets API**
-   - In *APIs & Services > Library*, search for "Google Sheets API" and click **Enable**
-5. **Enable the Google Docs API**
-   - In *APIs & Services > Library*, search for "Google Docs API" and click **Enable**
-6. **Configure the OAuth consent screen**
-   - Navigate to *APIs & Services > OAuth consent screen* and click **Get started**
-   - Enter an app name (e.g. `gdrive-mcp`), select your email as the support email, and click **Next**
-   - **Audience**: select *Internal* (Workspace users) or *External* (personal Gmail), then click **Next**
-   - **Contact Information**: enter your email and click **Next**
-   - **Finish**: check the policy agreement box and click **Create**
-7. **Add the required scopes**
-   - In the left sidebar, go to *Data Access*
-   - Click **Add or remove scopes**
-   - Add all three:
-     - `https://www.googleapis.com/auth/drive`
-     - `https://www.googleapis.com/auth/spreadsheets`
-     - `https://www.googleapis.com/auth/documents`
-   - Save
-8. **Create OAuth credentials**
-   - In the left sidebar, go to *Clients* and click **Create Client**
-   - Application type: **Desktop app**
-   - Name: `gdrive-mcp` (this is just a console label to help you identify this client later)
-   - Click **Create**
-   - Download the JSON file and save it to the `credentials/` folder at the root of this repo:
-     ```
-     gdrive-mcp/credentials/gcp-oauth.keys.json
-     ```
-
-### 3. Authenticate
+The setup script walks you through creating a Google Cloud project, enabling APIs, configuring OAuth, authenticating, and prints ready-to-copy MCP client config at the end. Run with `--dry-run` to preview without side effects:
 
 ```bash
-node dist/index.js auth
+npm run setup -- --dry-run
 ```
 
-A browser window will open for Google sign-in. After approval the token is saved to `credentials/.gdrive-server-credentials.json`.
-
-### 4. Add to your MCP client
+### 2. Add to your MCP client
 
 #### Claude Code CLI
 
@@ -244,35 +207,19 @@ Credential paths can be customized via environment variables:
 | `GDRIVE_OAUTH_PATH` | `credentials/gcp-oauth.keys.json` | Path to OAuth client secret |
 | `GDRIVE_CREDENTIALS_PATH` | `credentials/.gdrive-server-credentials.json` | Path to saved token |
 
-## Upgrading from read-only
+## Upgrading
 
-If you previously used this server before write support was added, your saved token likely only has `drive.readonly` and maybe `spreadsheets`. The Docs and expanded Drive write features require a fresh token with:
-
-- `https://www.googleapis.com/auth/drive`
-- `https://www.googleapis.com/auth/spreadsheets`
-- `https://www.googleapis.com/auth/documents`
-
-Re-authenticate with:
-
-```bash
-rm credentials/.gdrive-server-credentials.json
-node dist/index.js auth
-```
-
-This opens a new browser consent screen with the broader Drive, Sheets, and Docs permissions.
-
-> **Scope tradeoff:** This server now requests full `drive` rather than `drive.file`. That is broader than Google's narrowest best practice, but it is required to preserve the current "read any accessible Drive file" behavior and to support rename, duplicate, and write operations on arbitrary existing Docs. The `documents` scope is required for structured Docs reads and Docs `batchUpdate` writes.
-
-## Updating
-
-After pulling new changes, rebuild and the MCP server will pick up the update on next launch — no need to re-register it:
+After pulling new changes, run the upgrade script. It rebuilds the project and walks you through any new setup steps (new APIs, scope changes, re-authentication) based on [`setup-manifest.json`](setup-manifest.json):
 
 ```bash
 cd /path/to/gdrive-mcp
 git pull
-npm install
-npm run build
+npm run upgrade
 ```
+
+If no setup changes are needed, `npm run upgrade` just rebuilds and confirms you're up to date. The MCP server picks up changes on next launch — no need to re-register it.
+
+> **Scope tradeoff:** This server requests full `drive` rather than `drive.file`. That is broader than Google's narrowest best practice, but it is required to preserve the current "read any accessible Drive file" behavior and to support rename, duplicate, and write operations on arbitrary existing Docs. The `documents` scope is required for structured Docs reads and Docs `batchUpdate` writes.
 
 ## Notes
 

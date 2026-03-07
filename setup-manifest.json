@@ -1,0 +1,43 @@
+{
+  "setup_version": 2,
+  "min_node_version": 18,
+  "required_apis": [
+    {
+      "name": "Google Drive API",
+      "id": "drive.googleapis.com"
+    },
+    {
+      "name": "Google Sheets API",
+      "id": "sheets.googleapis.com"
+    },
+    {
+      "name": "Google Docs API",
+      "id": "docs.googleapis.com"
+    }
+  ],
+  "required_scopes": [
+    "https://www.googleapis.com/auth/drive",
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/documents"
+  ],
+  "console_links": {
+    "project_create": "https://console.cloud.google.com/projectcreate",
+    "api_library": "https://console.cloud.google.com/apis/library/{api_id}",
+    "oauth_consent": "https://console.cloud.google.com/auth/overview",
+    "oauth_client_create": "https://console.cloud.google.com/apis/credentials/oauthclient",
+    "credentials_list": "https://console.cloud.google.com/apis/credentials"
+  },
+  "migrations": [
+    {
+      "from_version_below": 2,
+      "to_version": 2,
+      "requires_reauth": true,
+      "added_apis": ["sheets.googleapis.com", "docs.googleapis.com"],
+      "added_scopes": [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/documents"
+      ],
+      "notice": "Google Sheets and Google Docs write support was added. Your saved token likely only has drive.readonly. Re-authentication is required so the server can request the broader Drive, Sheets, and Docs scopes."
+    }
+  ]
+}

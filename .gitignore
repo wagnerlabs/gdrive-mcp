@@ -4,6 +4,7 @@ dist/
 # Credentials — never commit OAuth keys or tokens
 credentials/gcp-oauth.keys.json
 credentials/.gdrive-server-credentials.json
+credentials/.gdrive-setup.json
 
 # Environment
 .env
