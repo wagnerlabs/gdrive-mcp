@@ -229,7 +229,7 @@ prompt_yes_no() {
     printf "%s [y/N] " "$prompt"
   fi
 
-  read -r yn
+  read -r yn < /dev/tty
   yn="${yn:-$default}"
   [[ "$yn" =~ ^[Yy] ]]
 }
@@ -265,7 +265,7 @@ ask_gcp_project() {
   info "Enter your Google Cloud project ID (or paste a console URL containing it)."
   info "Find it at https://console.cloud.google.com/ -- shown in the project selector at the top."
   printf "  Project ID: "
-  read -r input
+  read -r input < /dev/tty
 
   # Extract project ID from a URL if pasted
   if [[ "$input" == *"project="* ]]; then
@@ -323,7 +323,7 @@ wait_for_enter() {
   fi
   local msg="${1:-Press Enter to continue...}"
   printf "\n  ${BOLD}%s${RESET} " "$msg"
-  read -r
+  read -r < /dev/tty
 }
 
 # ---------------------------------------------------------------------------
