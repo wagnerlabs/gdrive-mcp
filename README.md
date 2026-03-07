@@ -11,14 +11,13 @@ Search, list, and read files, including automatic export of Google Docs as Markd
 ```bash
 git clone https://github.com/wagnerlabs/gdrive-mcp.git
 cd gdrive-mcp
-npm install
-npm run setup
+./scripts/install.sh
 ```
 
-The setup script walks you through creating a Google Cloud project, enabling APIs, configuring OAuth, authenticating, and prints ready-to-copy MCP client config at the end. Run with `--dry-run` to preview without side effects:
+The setup script installs dependencies, builds the project, and walks you through creating a Google Cloud project, enabling APIs, configuring OAuth, and authenticating. It prints ready-to-copy MCP client config at the end. Run with `--dry-run` to preview without side effects:
 
 ```bash
-npm run setup -- --dry-run
+./scripts/install.sh --dry-run
 ```
 
 ### 2. Add to your MCP client
@@ -214,10 +213,10 @@ After pulling new changes, run the upgrade script. It rebuilds the project and w
 ```bash
 cd /path/to/gdrive-mcp
 git pull
-npm run upgrade
+./scripts/upgrade.sh
 ```
 
-If no setup changes are needed, `npm run upgrade` just rebuilds and confirms you're up to date. The MCP server picks up changes on next launch — no need to re-register it.
+If no setup changes are needed, `./scripts/upgrade.sh` just rebuilds and confirms you're up to date. The MCP server picks up changes on next launch — no need to re-register it.
 
 > **Scope tradeoff:** This server requests full `drive` rather than `drive.file`. That is broader than Google's narrowest best practice, but it is required to preserve the current "read any accessible Drive file" behavior and to support rename, duplicate, and write operations on arbitrary existing Docs. The `documents` scope is required for structured Docs reads and Docs `batchUpdate` writes.
 

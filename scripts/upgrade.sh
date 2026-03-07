@@ -53,7 +53,7 @@ main() {
     printf "\n"
     success "You're up to date (setup_version=$MANIFEST_SETUP_VERSION)."
     if [[ "$SIDECAR_REAUTH_PENDING" == "true" ]]; then
-      warn "Re-authentication is still pending. Run: npm run upgrade"
+      warn "Re-authentication is still pending. Run: ./scripts/upgrade.sh"
     fi
     return
   fi
@@ -100,7 +100,7 @@ main() {
           success "APIs confirmed."
         else
           migration_skipped=true
-          warn "Skipped. Re-run 'npm run upgrade' after enabling the APIs."
+          warn "Skipped. Re-run './scripts/upgrade.sh' after enabling the APIs."
         fi
       fi
 
@@ -134,7 +134,7 @@ main() {
     if [[ "$migration_skipped" == true ]]; then
       write_sidecar "$SIDECAR_SETUP_VERSION" "true" "$SIDECAR_REAUTH_PENDING"
       printf "\n"
-      warn "Some migration steps were skipped. Version not advanced -- re-run 'npm run upgrade' when ready."
+      warn "Some migration steps were skipped. Version not advanced -- re-run './scripts/upgrade.sh' when ready."
       return
     fi
   fi
@@ -152,7 +152,7 @@ main() {
   if [[ "$SIDECAR_REAUTH_PENDING" == "true" ]]; then
     warn "Re-authentication was deferred. Run this to complete it later:"
     info "  rm \"$CREDENTIALS_FILE\" && node \"$REPO_ROOT/dist/index.js\" auth"
-    info "  Then run: npm run upgrade"
+    info "  Then run: ./scripts/upgrade.sh"
   fi
 }
 
@@ -171,12 +171,12 @@ handle_reauth() {
       else
         error "Re-authentication failed. Your existing credentials are unchanged."
         SIDECAR_REAUTH_PENDING=true
-        info "You can retry later with: npm run upgrade"
+        info "You can retry later with: ./scripts/upgrade.sh"
       fi
     fi
   else
     SIDECAR_REAUTH_PENDING=true
-    info "Skipped. To re-authenticate later, run: npm run upgrade"
+    info "Skipped. To re-authenticate later, run: ./scripts/upgrade.sh"
   fi
 }
 
