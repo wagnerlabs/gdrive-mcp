@@ -101,7 +101,7 @@ describe("runAuthFlow", () => {
     await expect(runAuthFlow()).rejects.toThrow(/myaccount.google.com/);
   });
 
-  it("requests both drive.readonly and spreadsheets scopes", async () => {
+  it("requests drive, spreadsheets, and documents scopes", async () => {
     const { authenticate } = await import("@google-cloud/local-auth");
     vi.mocked(authenticate).mockResolvedValue({
       credentials: { access_token: "at", refresh_token: "rt" },
@@ -119,8 +119,9 @@ describe("runAuthFlow", () => {
     expect(authenticate).toHaveBeenCalledWith(
       expect.objectContaining({
         scopes: [
-          "https://www.googleapis.com/auth/drive.readonly",
+          "https://www.googleapis.com/auth/drive",
           "https://www.googleapis.com/auth/spreadsheets",
+          "https://www.googleapis.com/auth/documents",
         ],
       }),
     );

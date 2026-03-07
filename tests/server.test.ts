@@ -2,6 +2,7 @@ import { describe, it, expect, vi } from "vitest";
 import { createServer } from "../src/server.js";
 import { DriveClient } from "../src/client.js";
 import { SheetsClient } from "../src/sheets-client.js";
+import { DocsClient } from "../src/docs-client.js";
 
 function makeMockDriveClient(): DriveClient {
   return {
@@ -30,11 +31,29 @@ function makeMockSheetsClient(): SheetsClient {
   } as unknown as SheetsClient;
 }
 
+function makeMockDocsClient(): DocsClient {
+  return {
+    getDocument: vi.fn(),
+    createDocument: vi.fn(),
+    getRevisionId: vi.fn(),
+    insertText: vi.fn(),
+    replaceText: vi.fn(),
+    replaceAllText: vi.fn(),
+    deleteText: vi.fn(),
+    updateTextStyle: vi.fn(),
+    updateParagraphStyle: vi.fn(),
+    updateList: vi.fn(),
+    renameDocument: vi.fn(),
+    duplicateDocument: vi.fn(),
+  } as unknown as DocsClient;
+}
+
 function makeServer() {
   const drive = makeMockDriveClient();
   const sheets = makeMockSheetsClient();
-  const server = createServer(drive, sheets);
-  return { server, drive, sheets };
+  const docs = makeMockDocsClient();
+  const server = createServer(drive, sheets, docs);
+  return { server, drive, sheets, docs };
 }
 
 function getTools(server: ReturnType<typeof createServer>) {
@@ -44,17 +63,18 @@ function getTools(server: ReturnType<typeof createServer>) {
 // ── Tool registration ────────────────────────────────────────────────
 
 describe("createServer — tool registration", () => {
-  it("registers all 15 tools", () => {
+  it("registers all 26 tools", () => {
     const { server } = makeServer();
     const names = Object.keys(getTools(server));
 
-    expect(names).toHaveLength(15);
+    expect(names).toHaveLength(26);
     for (const name of [
       "gdrive_search",
       "gdrive_get_file",
       "gdrive_read_file",
       "gdrive_list_files",
       "gdrive_get_spreadsheet_info",
+      "gdrive_get_document_info",
       "gdrive_create_sheet",
       "gdrive_update_sheet",
       "gdrive_append_sheet",
@@ -65,6 +85,16 @@ describe("createServer — tool registration", () => {
       "gdrive_rename_sheet_tab",
       "gdrive_insert_rows_columns",
       "gdrive_delete_rows_columns",
+      "gdrive_create_doc",
+      "gdrive_insert_doc_text",
+      "gdrive_replace_doc_text",
+      "gdrive_replace_all_doc_text",
+      "gdrive_delete_doc_text",
+      "gdrive_update_doc_text_style",
+      "gdrive_update_doc_paragraph_style",
+      "gdrive_update_doc_list",
+      "gdrive_rename_doc",
+      "gdrive_duplicate_doc",
     ]) {
       expect(names, `missing ${name}`).toContain(name);
     }
@@ -78,6 +108,7 @@ describe("createServer — tool registration", () => {
       "gdrive_read_file",
       "gdrive_list_files",
       "gdrive_get_spreadsheet_info",
+      "gdrive_get_document_info",
     ]) {
       const ann = tools[name].annotations;
       expect(ann?.readOnlyHint, `${name} readOnlyHint`).toBe(true);
@@ -101,6 +132,16 @@ describe("createServer — tool registration", () => {
       gdrive_rename_sheet_tab: { readOnly: false, destructive: true, idempotent: false },
       gdrive_insert_rows_columns: { readOnly: false, destructive: false, idempotent: false },
       gdrive_delete_rows_columns: { readOnly: false, destructive: true, idempotent: false },
+      gdrive_create_doc: { readOnly: false, destructive: false, idempotent: false },
+      gdrive_insert_doc_text: { readOnly: false, destructive: false, idempotent: false },
+      gdrive_replace_doc_text: { readOnly: false, destructive: true, idempotent: false },
+      gdrive_replace_all_doc_text: { readOnly: false, destructive: true, idempotent: true },
+      gdrive_delete_doc_text: { readOnly: false, destructive: true, idempotent: false },
+      gdrive_update_doc_text_style: { readOnly: false, destructive: false, idempotent: true },
+      gdrive_update_doc_paragraph_style: { readOnly: false, destructive: false, idempotent: true },
+      gdrive_update_doc_list: { readOnly: false, destructive: true, idempotent: true },
+      gdrive_rename_doc: { readOnly: false, destructive: true, idempotent: false },
+      gdrive_duplicate_doc: { readOnly: false, destructive: false, idempotent: false },
     };
     for (const [name, exp] of Object.entries(expected)) {
       const ann = tools[name].annotations;

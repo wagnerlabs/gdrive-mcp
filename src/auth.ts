@@ -6,8 +6,9 @@ import * as path from "path";
 import { fileURLToPath } from "url";
 
 const SCOPES = [
-  "https://www.googleapis.com/auth/drive.readonly",
+  "https://www.googleapis.com/auth/drive",
   "https://www.googleapis.com/auth/spreadsheets",
+  "https://www.googleapis.com/auth/documents",
 ];
 
 const PROJECT_ROOT = path.resolve(

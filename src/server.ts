@@ -3,12 +3,25 @@ import { ToolAnnotations } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import { DriveClient, DriveAPIError } from "./client.js";
 import { SheetsClient, FormatOptions } from "./sheets-client.js";
+import {
+  DocListPreset,
+  DocNamedStyleType,
+  DocParagraphAlignment,
+  DocsClient,
+  DocsConflictMode,
+  NormalizedDocElement,
+  NormalizedDocTab,
+  NormalizedDocument,
+} from "./docs-client.js";
 
 const SAFE: ToolAnnotations = {
   readOnlyHint: true,
   destructiveHint: false,
   openWorldHint: true,
 };
+
+const DOC_PLACEHOLDER_CHAR = "\uFFFC";
+const HEX_COLOR_PATTERN = /^#?[0-9A-Fa-f]{6}$/;
 
 function errorResult(err: unknown): {
   content: Array<{ type: "text"; text: string }>;
@@ -34,6 +47,10 @@ function jsonResult(data: unknown): { content: Array<{ type: "text"; text: strin
 
 function spreadsheetUrl(id: string): string {
   return `https://docs.google.com/spreadsheets/d/${id}/edit`;
+}
+
+function documentUrl(id: string): string {
+  return `https://docs.google.com/document/d/${id}/edit`;
 }
 
 function padValues(
@@ -99,9 +116,129 @@ function checkPrecondition(
 const CellValue = z.union([z.string(), z.number(), z.boolean()]);
 const ValuesArray = z.array(z.array(CellValue));
 
+interface CachedDocumentTabContent {
+  documentId: string;
+  revisionId: string;
+  tabId: string;
+  tab: NormalizedDocTab;
+  searchableText: string;
+  baseIndex: number;
+}
+
+interface ResolvedDocumentRange {
+  tabId: string;
+  startIndex: number;
+  endIndex: number;
+  actualText: string;
+  snapshot: CachedDocumentTabContent;
+}
+
+function docCacheKey(documentId: string, revisionId: string, tabId: string): string {
+  return `${documentId}::${revisionId}::${tabId}`;
+}
+
+function coerceSegmentLength(text: string, expectedLength: number): string {
+  if (expectedLength <= 0) {
+    return "";
+  }
+  if (text.length === expectedLength) {
+    return text;
+  }
+  if (text.length > expectedLength) {
+    return text.slice(0, expectedLength);
+  }
+  return text + DOC_PLACEHOLDER_CHAR.repeat(expectedLength - text.length);
+}
+
+function searchableTextForElement(element: NormalizedDocElement): string {
+  const expectedLength = Math.max(0, element.endIndex - element.startIndex);
+  if (element.type === "textRun") {
+    return coerceSegmentLength(element.text, expectedLength);
+  }
+  return DOC_PLACEHOLDER_CHAR.repeat(Math.max(1, expectedLength));
+}
+
+function buildSearchableTabText(tab: NormalizedDocTab): {
+  searchableText: string;
+  baseIndex: number;
+} {
+  const paragraphs = (tab.paragraphs ?? []).slice().sort((left, right) => left.startIndex - right.startIndex);
+  if (paragraphs.length === 0) {
+    return { searchableText: "", baseIndex: 1 };
+  }
+
+  let searchableText = "";
+  const baseIndex = paragraphs[0].startIndex;
+  let cursor = baseIndex;
+
+  for (const paragraph of paragraphs) {
+    if (paragraph.startIndex > cursor) {
+      searchableText += DOC_PLACEHOLDER_CHAR.repeat(paragraph.startIndex - cursor);
+      cursor = paragraph.startIndex;
+    }
+
+    for (const element of paragraph.elements) {
+      if (element.startIndex > cursor) {
+        searchableText += DOC_PLACEHOLDER_CHAR.repeat(element.startIndex - cursor);
+        cursor = element.startIndex;
+      }
+
+      searchableText += searchableTextForElement(element);
+      cursor = element.endIndex;
+    }
+
+    if (paragraph.endIndex > cursor) {
+      searchableText += DOC_PLACEHOLDER_CHAR.repeat(paragraph.endIndex - cursor);
+      cursor = paragraph.endIndex;
+    }
+  }
+
+  return { searchableText, baseIndex };
+}
+
+function extractRangeText(
+  snapshot: CachedDocumentTabContent,
+  startIndex: number,
+  endIndex: number,
+): string {
+  const startOffset = startIndex - snapshot.baseIndex;
+  const endOffset = endIndex - snapshot.baseIndex;
+  if (startOffset < 0 || endOffset < startOffset) {
+    return "";
+  }
+  return snapshot.searchableText.slice(startOffset, endOffset);
+}
+
+function findTextMatches(
+  haystack: string,
+  needle: string,
+  matchCase: boolean,
+): Array<{ startOffset: number; endOffset: number }> {
+  if (!needle) {
+    return [];
+  }
+
+  const source = matchCase ? haystack : haystack.toLowerCase();
+  const target = matchCase ? needle : needle.toLowerCase();
+  const matches: Array<{ startOffset: number; endOffset: number }> = [];
+
+  let fromIndex = 0;
+  while (true) {
+    const offset = source.indexOf(target, fromIndex);
+    if (offset === -1) {
+      break;
+    }
+    matches.push({ startOffset: offset, endOffset: offset + target.length });
+    fromIndex = offset + Math.max(target.length, 1);
+  }
+
+  return matches;
+}
+
 export function createServer(
   driveClient: DriveClient,
   sheetsClient: SheetsClient,
+  docsClient: DocsClient,
 ): McpServer {
   const server = new McpServer({
     name: "gdrive-mcp",
@@ -109,6 +246,363 @@ export function createServer(
   });
 
   const accessedSpreadsheets = new Set<string>();
+  const accessedDocs = new Set<string>();
+  const lastSeenDocRevision = new Map<string, string>();
+  const structuredDocCache = new Map<string, CachedDocumentTabContent>();
+
+  function evictStructuredDocumentCache(
+    documentId: string,
+    keepRevisionId?: string,
+  ): void {
+    for (const [cacheKey, cached] of structuredDocCache.entries()) {
+      if (
+        cached.documentId === documentId &&
+        cached.revisionId !== keepRevisionId
+      ) {
+        structuredDocCache.delete(cacheKey);
+      }
+    }
+  }
+
+  function rememberDocumentRead(documentId: string, revisionId?: string): void {
+    accessedDocs.add(documentId);
+    if (revisionId) {
+      const previousRevisionId = lastSeenDocRevision.get(documentId);
+      lastSeenDocRevision.set(documentId, revisionId);
+      if (previousRevisionId !== revisionId) {
+        evictStructuredDocumentCache(documentId, revisionId);
+      }
+    }
+  }
+
+  function cacheStructuredDocument(document: NormalizedDocument): void {
+    if (!document.revisionId || document.contentTruncated) {
+      return;
+    }
+
+    for (const tab of document.tabs) {
+      if (!tab.paragraphs) {
+        continue;
+      }
+      const search = buildSearchableTabText(tab);
+      structuredDocCache.set(docCacheKey(document.documentId, document.revisionId, tab.tabId), {
+        documentId: document.documentId,
+        revisionId: document.revisionId,
+        tabId: tab.tabId,
+        tab,
+        searchableText: search.searchableText,
+        baseIndex: search.baseIndex,
+      });
+    }
+  }
+
+  function rememberDocumentSnapshot(document: NormalizedDocument): void {
+    rememberDocumentRead(document.documentId, document.revisionId);
+    cacheStructuredDocument(document);
+  }
+
+  function unreadDocumentError(): Error {
+    return new Error(
+      "You must read this document before writing to it. " +
+        "Use gdrive_read_file or gdrive_get_document_info first.",
+    );
+  }
+
+  async function fetchDocumentMetadata(documentId: string): Promise<NormalizedDocument> {
+    const metadata = await docsClient.getDocument(documentId, {
+      includeContent: false,
+    });
+    rememberDocumentSnapshot(metadata);
+    return metadata;
+  }
+
+  async function ensureDocumentRevision(documentId: string): Promise<string> {
+    const cached = lastSeenDocRevision.get(documentId);
+    if (cached) {
+      return cached;
+    }
+
+    const metadata = await fetchDocumentMetadata(documentId);
+    if (!metadata.revisionId) {
+      throw new Error(
+        "Could not determine the current document revision. " +
+          "Make sure you have edit access, then read the document again.",
+      );
+    }
+    return metadata.revisionId;
+  }
+
+  async function resolveDocumentTab(
+    documentId: string,
+    requestedTabId?: string,
+  ): Promise<{ document: NormalizedDocument; tab: NormalizedDocTab }> {
+    const document = await fetchDocumentMetadata(documentId);
+    if (document.tabs.length === 0) {
+      throw new Error("This document does not expose any editable tabs.");
+    }
+
+    const tab = requestedTabId
+      ? document.tabs.find((candidate) => candidate.tabId === requestedTabId)
+      : document.tabs[0];
+
+    if (!tab) {
+      throw new Error(`Tab "${requestedTabId}" not found in document.`);
+    }
+
+    return { document, tab };
+  }
+
+  function assertRangeWithinSnapshot(
+    snapshot: CachedDocumentTabContent,
+    startIndex: number,
+    endIndex: number,
+  ): void {
+    const lowerBound = snapshot.baseIndex;
+    const upperBound = snapshot.baseIndex + snapshot.searchableText.length;
+    if (startIndex < lowerBound || endIndex > upperBound || startIndex >= endIndex) {
+      throw new Error(
+        `Range [${startIndex}, ${endIndex}) is outside the current content for tab "${snapshot.tab.title}". ` +
+          "Use gdrive_get_document_info include_content=true to inspect the latest indices.",
+      );
+    }
+  }
+
+  async function getStructuredDocumentTab(
+    documentId: string,
+    requestedTabId?: string,
+  ): Promise<CachedDocumentTabContent> {
+    const { tab } = await resolveDocumentTab(documentId, requestedTabId);
+    const revisionId = lastSeenDocRevision.get(documentId);
+    if (revisionId) {
+      const cached = structuredDocCache.get(docCacheKey(documentId, revisionId, tab.tabId));
+      if (cached) {
+        return cached;
+      }
+    }
+
+    const snapshot = await docsClient.getDocument(documentId, {
+      includeContent: true,
+      tabId: tab.tabId,
+      maxChars: 250_000,
+      maxParagraphs: 5_000,
+    });
+    rememberDocumentSnapshot(snapshot);
+
+    if (snapshot.contentTruncated) {
+      throw new Error(
+        "Document content was truncated during internal anchor resolution. " +
+          "Use gdrive_get_document_info with include_content=true and a narrower tab, or provide explicit indices.",
+      );
+    }
+
+    const nextRevisionId = snapshot.revisionId;
+    if (nextRevisionId) {
+      const cached = structuredDocCache.get(docCacheKey(documentId, nextRevisionId, tab.tabId));
+      if (cached) {
+        return cached;
+      }
+    }
+
+    const snapshotTab = snapshot.tabs.find((candidate) => candidate.tabId === tab.tabId);
+    if (!snapshotTab?.paragraphs) {
+      throw new Error(`Tab "${tab.tabId}" did not return structured content.`);
+    }
+
+    const search = buildSearchableTabText(snapshotTab);
+    const built: CachedDocumentTabContent = {
+      documentId,
+      revisionId: snapshot.revisionId ?? lastSeenDocRevision.get(documentId) ?? "",
+      tabId: tab.tabId,
+      tab: snapshotTab,
+      searchableText: search.searchableText,
+      baseIndex: search.baseIndex,
+    };
+
+    if (built.revisionId) {
+      structuredDocCache.set(docCacheKey(documentId, built.revisionId, tab.tabId), built);
+    }
+
+    return built;
+  }
+
+  async function resolveDocumentRange(options: {
+    documentId: string;
+    tabId?: string;
+    startIndex?: number;
+    endIndex?: number;
+    targetText?: string;
+    occurrence?: number;
+    matchCase?: boolean;
+    expectedText?: string;
+  }): Promise<ResolvedDocumentRange> {
+    const hasExplicitRange = options.startIndex !== undefined || options.endIndex !== undefined;
+    const hasTargetText = options.targetText !== undefined;
+
+    if (hasExplicitRange === hasTargetText) {
+      throw new Error(
+        "Provide exactly one target mode: either start_index/end_index or target_text.",
+      );
+    }
+
+    const snapshot = await getStructuredDocumentTab(options.documentId, options.tabId);
+
+    if (hasExplicitRange) {
+      if (options.startIndex === undefined || options.endIndex === undefined) {
+        throw new Error("Both start_index and end_index are required when using explicit ranges.");
+      }
+      assertRangeWithinSnapshot(snapshot, options.startIndex, options.endIndex);
+      const actualText = extractRangeText(snapshot, options.startIndex, options.endIndex);
+      if (options.expectedText !== undefined && actualText !== options.expectedText) {
+        throw new Error(
+          "Precondition failed: current document text does not match expected_text.\n" +
+            `Actual text: ${JSON.stringify(actualText)}`,
+        );
+      }
+      return {
+        tabId: snapshot.tabId,
+        startIndex: options.startIndex,
+        endIndex: options.endIndex,
+        actualText,
+        snapshot,
+      };
+    }
+
+    const targetText = options.targetText ?? "";
+    const matches = findTextMatches(
+      snapshot.searchableText,
+      targetText,
+      options.matchCase ?? true,
+    );
+
+    if (matches.length === 0) {
+      throw new Error(
+        `Could not find ${JSON.stringify(targetText)} in the current tab content. ` +
+          "Inspect current content with gdrive_get_document_info include_content=true.",
+      );
+    }
+
+    if (options.occurrence === undefined && matches.length > 1) {
+      throw new Error(
+        `Found ${matches.length} matches for ${JSON.stringify(targetText)}. ` +
+          "Provide occurrence (1-based) or inspect current content with gdrive_get_document_info include_content=true.",
+      );
+    }
+
+    const occurrence = options.occurrence ?? 1;
+    if (occurrence < 1) {
+      throw new Error("occurrence must be 1 or greater.");
+    }
+    if (occurrence > matches.length) {
+      throw new Error(
+        `occurrence ${occurrence} is out of range; only ${matches.length} match(es) were found for ${JSON.stringify(targetText)}.`,
+      );
+    }
+
+    const match = matches[occurrence - 1];
+    const startIndex = snapshot.baseIndex + match.startOffset;
+    const endIndex = snapshot.baseIndex + match.endOffset;
+    const actualText = extractRangeText(snapshot, startIndex, endIndex);
+
+    if (options.expectedText !== undefined && actualText !== options.expectedText) {
+      throw new Error(
+        "Precondition failed: current document text does not match expected_text.\n" +
+          `Actual text: ${JSON.stringify(actualText)}`,
+      );
+    }
+
+    return {
+      tabId: snapshot.tabId,
+      startIndex,
+      endIndex,
+      actualText,
+      snapshot,
+    };
+  }
+
+  async function resolveInsertTarget(options: {
+    documentId: string;
+    tabId?: string;
+    index?: number;
+    position?: "start" | "end";
+    beforeText?: string;
+    afterText?: string;
+    occurrence?: number;
+    matchCase?: boolean;
+  }): Promise<{ tabId: string; index?: number; atEnd: boolean }> {
+    const modes = [
+      options.index !== undefined,
+      options.position !== undefined,
+      options.beforeText !== undefined,
+      options.afterText !== undefined,
+    ].filter(Boolean).length;
+
+    if (modes !== 1) {
+      throw new Error(
+        "Provide exactly one insertion target: index, position, before_text, or after_text.",
+      );
+    }
+
+    if (options.index !== undefined) {
+      const snapshot = await getStructuredDocumentTab(options.documentId, options.tabId);
+      const lowerBound = snapshot.baseIndex;
+      const upperBound = snapshot.baseIndex + snapshot.searchableText.length;
+      if (options.index < lowerBound || options.index > upperBound) {
+        throw new Error(
+          `Insertion index ${options.index} is outside the current tab content. ` +
+            "Use gdrive_get_document_info include_content=true to inspect valid indices.",
+        );
+      }
+      return { tabId: snapshot.tabId, index: options.index, atEnd: false };
+    }
+
+    if (options.position === "end") {
+      const { tab } = await resolveDocumentTab(options.documentId, options.tabId);
+      return { tabId: tab.tabId, atEnd: true };
+    }
+
+    if (options.position === "start") {
+      const snapshot = await getStructuredDocumentTab(options.documentId, options.tabId);
+      const firstParagraph = snapshot.tab.paragraphs?.[0];
+      return {
+        tabId: snapshot.tabId,
+        index: firstParagraph?.startIndex ?? snapshot.baseIndex,
+        atEnd: false,
+      };
+    }
+
+    const anchorRange = await resolveDocumentRange({
+      documentId: options.documentId,
+      tabId: options.tabId,
+      targetText: options.beforeText ?? options.afterText,
+      occurrence: options.occurrence,
+      matchCase: options.matchCase,
+    });
+
+    return {
+      tabId: anchorRange.tabId,
+      index: options.beforeText ? anchorRange.startIndex : anchorRange.endIndex,
+      atEnd: false,
+    };
+  }
+
+  function snapRangeToParagraphs(
+    snapshot: CachedDocumentTabContent,
+    startIndex: number,
+    endIndex: number,
+  ): { startIndex: number; endIndex: number } {
+    const overlapping = (snapshot.tab.paragraphs ?? []).filter(
+      (paragraph) => paragraph.endIndex > startIndex && paragraph.startIndex < endIndex,
+    );
+    if (overlapping.length === 0) {
+      throw new Error(
+        "The selected range does not overlap any paragraph boundaries in the current tab content.",
+      );
+    }
+    return {
+      startIndex: overlapping[0].startIndex,
+      endIndex: overlapping[overlapping.length - 1].endIndex,
+    };
+  }
 
   // ── Read-only Drive tools ──────────────────────────────────────────
 
@@ -179,15 +673,27 @@ export function createServer(
       try {
         const meta = await driveClient.getFile(file_id);
         const result = await driveClient.readFile(file_id, max_chars);
+        const resolvedTargetId =
+          meta.mimeType === "application/vnd.google-apps.shortcut"
+            ? meta.shortcutTarget?.id
+            : file_id;
+        const resolvedTargetMimeType =
+          meta.mimeType === "application/vnd.google-apps.shortcut"
+            ? meta.shortcutTarget?.mimeType
+            : meta.mimeType;
 
-        if (meta.mimeType === "application/vnd.google-apps.spreadsheet") {
-          accessedSpreadsheets.add(file_id);
-        } else if (
-          meta.mimeType === "application/vnd.google-apps.shortcut" &&
-          meta.shortcutTarget?.mimeType ===
-            "application/vnd.google-apps.spreadsheet"
-        ) {
-          accessedSpreadsheets.add(meta.shortcutTarget.id);
+        if (resolvedTargetMimeType === "application/vnd.google-apps.spreadsheet" && resolvedTargetId) {
+          accessedSpreadsheets.add(resolvedTargetId);
+        }
+
+        if (resolvedTargetMimeType === "application/vnd.google-apps.document" && resolvedTargetId) {
+          rememberDocumentRead(resolvedTargetId);
+          try {
+            const revisionId = await docsClient.getRevisionId(resolvedTargetId);
+            rememberDocumentRead(resolvedTargetId, revisionId);
+          } catch {
+            // Preserve Markdown read behavior even if revision caching is unavailable.
+          }
         }
 
         return {
@@ -257,6 +763,54 @@ export function createServer(
       try {
         const info = await sheetsClient.getSpreadsheet(spreadsheet_id);
         accessedSpreadsheets.add(spreadsheet_id);
+        return jsonResult(info);
+      } catch (err) {
+        return errorResult(err);
+      }
+    },
+  );
+
+  // ── Read-only Docs tool ────────────────────────────────────────────
+
+  server.tool(
+    "gdrive_get_document_info",
+    "Get structured Google Docs metadata and optional tab-scoped content. " +
+      "By default this is metadata-first so large documents stay compact. " +
+      "Set include_content=true to retrieve paragraph-level content for one tab or all tabs. " +
+      "Example: {\"document_id\":\"doc123\",\"include_content\":true,\"tab_id\":\"tab-1\",\"max_chars\":12000,\"max_paragraphs\":80}.",
+    {
+      document_id: z.string().describe("Google Docs document ID"),
+      include_content: z
+        .boolean()
+        .default(false)
+        .describe("Include structured paragraph content in the response"),
+      tab_id: z
+        .string()
+        .optional()
+        .describe("Optional tab ID to scope returned content to a specific tab"),
+      max_chars: z
+        .number()
+        .int()
+        .min(0)
+        .default(20_000)
+        .describe("Maximum characters of structured content to return when include_content=true"),
+      max_paragraphs: z
+        .number()
+        .int()
+        .min(1)
+        .default(200)
+        .describe("Maximum paragraphs to return when include_content=true"),
+    },
+    SAFE,
+    async ({ document_id, include_content, tab_id, max_chars, max_paragraphs }) => {
+      try {
+        const info = await docsClient.getDocument(document_id, {
+          includeContent: include_content,
+          tabId: tab_id,
+          maxChars: max_chars,
+          maxParagraphs: max_paragraphs,
+        });
+        rememberDocumentSnapshot(info);
         return jsonResult(info);
       } catch (err) {
         return errorResult(err);
@@ -825,6 +1379,783 @@ export function createServer(
           startIndex: start_index,
           count,
         });
+      } catch (err) {
+        return errorResult(err);
+      }
+    },
+  );
+
+  // ── Write tools — Docs content and formatting ──────────────────────
+
+  const docConflictModeSchema = z
+    .enum(["strict", "merge"])
+    .default("strict")
+    .describe(
+      "strict uses requiredRevisionId and fails on concurrent edits; merge uses targetRevisionId for collaborative merges.",
+    );
+  const docNamedStyleSchema = z
+    .enum([
+      "NORMAL_TEXT",
+      "TITLE",
+      "SUBTITLE",
+      "HEADING_1",
+      "HEADING_2",
+      "HEADING_3",
+      "HEADING_4",
+      "HEADING_5",
+      "HEADING_6",
+    ])
+    .describe("Paragraph named style, e.g. HEADING_2");
+  const docAlignmentSchema = z
+    .enum(["START", "CENTER", "END", "JUSTIFIED"])
+    .describe("Paragraph alignment");
+  const docColorSchema = z
+    .string()
+    .regex(HEX_COLOR_PATTERN, "Expected a 6-digit hex color such as #3366FF.")
+    .describe("Hex color such as #3366FF");
+  const docListPresetSchema = z
+    .enum(["BULLETED", "NUMBERED", "CHECKBOX", "REMOVE"])
+    .describe("High-level list preset or REMOVE to clear bullets");
+
+  server.tool(
+    "gdrive_create_doc",
+    "Create a blank Google Doc. Optionally move it into a specific folder after creation.",
+    {
+      title: z.string().describe("Document title"),
+      folder_id: z
+        .string()
+        .default("root")
+        .describe("Destination folder ID, or 'root' for the user's root Drive folder"),
+    },
+    {
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: true,
+    } satisfies ToolAnnotations,
+    async ({ title, folder_id }) => {
+      try {
+        const result = await docsClient.createDocument(title, folder_id);
+        rememberDocumentRead(result.documentId, result.revisionId);
+        return jsonResult(result);
+      } catch (err) {
+        return errorResult(err);
+      }
+    },
+  );
+
+  server.tool(
+    "gdrive_insert_doc_text",
+    "Insert text into an existing Google Doc. Prefer position:'start'|'end' or before_text/after_text anchors instead of raw indices when possible. " +
+      "Examples: {\"document_id\":\"doc123\",\"position\":\"end\",\"text\":\"\\nSummary\"} or {\"document_id\":\"doc123\",\"before_text\":\"TODO\",\"occurrence\":1,\"text\":\"- \"}.",
+    {
+      document_id: z.string().describe("Google Docs document ID"),
+      tab_id: z.string().optional().describe("Optional tab ID; defaults to the first tab"),
+      text: z.string().describe("Text to insert"),
+      index: z
+        .number()
+        .int()
+        .min(0)
+        .optional()
+        .describe("Power-user fallback: explicit UTF-16 insertion index"),
+      position: z
+        .enum(["start", "end"])
+        .optional()
+        .describe("LLM-friendly insertion target without index arithmetic"),
+      before_text: z
+        .string()
+        .optional()
+        .describe("Insert immediately before this exact text match"),
+      after_text: z
+        .string()
+        .optional()
+        .describe("Insert immediately after this exact text match"),
+      occurrence: z
+        .number()
+        .int()
+        .min(1)
+        .optional()
+        .describe("1-based match occurrence when before_text/after_text is repeated"),
+      match_case: z
+        .boolean()
+        .default(true)
+        .describe("Whether before_text/after_text matching is case-sensitive"),
+      conflict_mode: docConflictModeSchema,
+    },
+    {
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: true,
+    } satisfies ToolAnnotations,
+    async ({
+      document_id,
+      tab_id,
+      text,
+      index,
+      position,
+      before_text,
+      after_text,
+      occurrence,
+      match_case,
+      conflict_mode,
+    }) => {
+      if (!accessedDocs.has(document_id)) {
+        return errorResult(unreadDocumentError());
+      }
+
+      try {
+        const target = await resolveInsertTarget({
+          documentId: document_id,
+          tabId: tab_id,
+          index,
+          position,
+          beforeText: before_text,
+          afterText: after_text,
+          occurrence,
+          matchCase: match_case,
+        });
+        const revisionId = await ensureDocumentRevision(document_id);
+        const result = await docsClient.insertText({
+          documentId: document_id,
+          text,
+          tabId: target.tabId,
+          index: target.index,
+          atEnd: target.atEnd,
+          revisionId,
+          conflictMode: conflict_mode as DocsConflictMode,
+        });
+        rememberDocumentRead(document_id, result.revisionId);
+        return jsonResult({
+          documentId: document_id,
+          documentUrl: documentUrl(document_id),
+          tabId: target.tabId,
+          revisionId: result.revisionId,
+          insertedText: text,
+          position: target.atEnd ? "end" : undefined,
+          index: target.index,
+        });
+      } catch (err) {
+        return errorResult(err);
+      }
+    },
+  );
+
+  server.tool(
+    "gdrive_replace_doc_text",
+    "Replace a targeted text range in an existing Google Doc. Use target_text for anchored replacements or explicit start_index/end_index as a fallback. " +
+      "Example: {\"document_id\":\"doc123\",\"target_text\":\"Draft\",\"replacement_text\":\"Final\",\"occurrence\":1,\"expected_text\":\"Draft\"}.",
+    {
+      document_id: z.string().describe("Google Docs document ID"),
+      tab_id: z.string().optional().describe("Optional tab ID; defaults to the first tab"),
+      replacement_text: z.string().describe("Replacement text; use an empty string only if you intentionally want a delete-style replacement"),
+      start_index: z.number().int().min(0).optional().describe("Explicit UTF-16 start index"),
+      end_index: z.number().int().min(0).optional().describe("Explicit UTF-16 end index (exclusive)"),
+      target_text: z
+        .string()
+        .optional()
+        .describe("Anchor to replace this exact text match instead of passing indices"),
+      occurrence: z
+        .number()
+        .int()
+        .min(1)
+        .optional()
+        .describe("1-based match occurrence when target_text appears multiple times"),
+      match_case: z
+        .boolean()
+        .default(true)
+        .describe("Whether target_text matching is case-sensitive"),
+      expected_text: z
+        .string()
+        .optional()
+        .describe("Optional optimistic safety check for the current text in the resolved range"),
+      conflict_mode: docConflictModeSchema,
+    },
+    {
+      readOnlyHint: false,
+      destructiveHint: true,
+      idempotentHint: false,
+      openWorldHint: true,
+    } satisfies ToolAnnotations,
+    async ({
+      document_id,
+      tab_id,
+      replacement_text,
+      start_index,
+      end_index,
+      target_text,
+      occurrence,
+      match_case,
+      expected_text,
+      conflict_mode,
+    }) => {
+      if (!accessedDocs.has(document_id)) {
+        return errorResult(unreadDocumentError());
+      }
+
+      try {
+        const resolved = await resolveDocumentRange({
+          documentId: document_id,
+          tabId: tab_id,
+          startIndex: start_index,
+          endIndex: end_index,
+          targetText: target_text,
+          occurrence,
+          matchCase: match_case,
+          expectedText: expected_text,
+        });
+        const revisionId = await ensureDocumentRevision(document_id);
+        const result = await docsClient.replaceText({
+          documentId: document_id,
+          text: replacement_text,
+          tabId: resolved.tabId,
+          startIndex: resolved.startIndex,
+          endIndex: resolved.endIndex,
+          revisionId,
+          conflictMode: conflict_mode as DocsConflictMode,
+        });
+        rememberDocumentRead(document_id, result.revisionId);
+        return jsonResult({
+          documentId: document_id,
+          documentUrl: documentUrl(document_id),
+          tabId: resolved.tabId,
+          revisionId: result.revisionId,
+          previousText: resolved.actualText,
+          replacementText: replacement_text,
+          replacedRange: {
+            startIndex: resolved.startIndex,
+            endIndex: resolved.endIndex,
+          },
+        });
+      } catch (err) {
+        return errorResult(err);
+      }
+    },
+  );
+
+  server.tool(
+    "gdrive_replace_all_doc_text",
+    "Replace every exact text match in a Google Doc. For safety this defaults to the first tab unless you pass tab_id or set all_tabs=true explicitly. " +
+      "Set match_case=false when casing is uncertain. Example: {\"document_id\":\"doc123\",\"old_text\":\"Acme\",\"new_text\":\"Wagner Labs\",\"all_tabs\":true}.",
+    {
+      document_id: z.string().describe("Google Docs document ID"),
+      old_text: z.string().describe("Exact text to find"),
+      new_text: z.string().describe("Replacement text"),
+      tab_id: z
+        .string()
+        .optional()
+        .describe("Optional tab ID to scope replacement to a specific tab"),
+      all_tabs: z
+        .boolean()
+        .default(false)
+        .describe("Explicit opt-in to replace across every tab in the document"),
+      match_case: z
+        .boolean()
+        .default(true)
+        .describe("Whether old_text matching is case-sensitive"),
+      conflict_mode: docConflictModeSchema,
+    },
+    {
+      readOnlyHint: false,
+      destructiveHint: true,
+      idempotentHint: true,
+      openWorldHint: true,
+    } satisfies ToolAnnotations,
+    async ({ document_id, old_text, new_text, tab_id, all_tabs, match_case, conflict_mode }) => {
+      if (!accessedDocs.has(document_id)) {
+        return errorResult(unreadDocumentError());
+      }
+
+      if (all_tabs && tab_id) {
+        return errorResult(
+          new Error("Pass either tab_id or all_tabs=true, not both."),
+        );
+      }
+
+      try {
+        const revisionId = await ensureDocumentRevision(document_id);
+        const scopedTabId = all_tabs
+          ? undefined
+          : (await resolveDocumentTab(document_id, tab_id)).tab.tabId;
+        const result = await docsClient.replaceAllText({
+          documentId: document_id,
+          searchText: old_text,
+          replaceText: new_text,
+          matchCase: match_case,
+          tabId: scopedTabId,
+          allTabs: all_tabs,
+          revisionId,
+          conflictMode: conflict_mode as DocsConflictMode,
+        });
+        rememberDocumentRead(document_id, result.revisionId);
+        const occurrencesChanged = (result.replies?.[0] as { replaceAllText?: { occurrencesChanged?: number } } | undefined)
+          ?.replaceAllText?.occurrencesChanged;
+        return jsonResult({
+          documentId: document_id,
+          documentUrl: documentUrl(document_id),
+          revisionId: result.revisionId,
+          tabId: scopedTabId,
+          allTabs: all_tabs,
+          oldText: old_text,
+          newText: new_text,
+          matchCase: match_case,
+          occurrencesChanged,
+        });
+      } catch (err) {
+        return errorResult(err);
+      }
+    },
+  );
+
+  server.tool(
+    "gdrive_delete_doc_text",
+    "Delete a targeted text range from a Google Doc using explicit indices or target_text anchors.",
+    {
+      document_id: z.string().describe("Google Docs document ID"),
+      tab_id: z.string().optional().describe("Optional tab ID; defaults to the first tab"),
+      start_index: z.number().int().min(0).optional().describe("Explicit UTF-16 start index"),
+      end_index: z.number().int().min(0).optional().describe("Explicit UTF-16 end index (exclusive)"),
+      target_text: z
+        .string()
+        .optional()
+        .describe("Anchor to delete this exact text match instead of passing indices"),
+      occurrence: z
+        .number()
+        .int()
+        .min(1)
+        .optional()
+        .describe("1-based match occurrence when target_text appears multiple times"),
+      match_case: z
+        .boolean()
+        .default(true)
+        .describe("Whether target_text matching is case-sensitive"),
+      expected_text: z
+        .string()
+        .optional()
+        .describe("Optional optimistic safety check for the current text in the resolved range"),
+      conflict_mode: docConflictModeSchema,
+    },
+    {
+      readOnlyHint: false,
+      destructiveHint: true,
+      idempotentHint: false,
+      openWorldHint: true,
+    } satisfies ToolAnnotations,
+    async ({
+      document_id,
+      tab_id,
+      start_index,
+      end_index,
+      target_text,
+      occurrence,
+      match_case,
+      expected_text,
+      conflict_mode,
+    }) => {
+      if (!accessedDocs.has(document_id)) {
+        return errorResult(unreadDocumentError());
+      }
+
+      try {
+        const resolved = await resolveDocumentRange({
+          documentId: document_id,
+          tabId: tab_id,
+          startIndex: start_index,
+          endIndex: end_index,
+          targetText: target_text,
+          occurrence,
+          matchCase: match_case,
+          expectedText: expected_text,
+        });
+        const revisionId = await ensureDocumentRevision(document_id);
+        const result = await docsClient.deleteText({
+          documentId: document_id,
+          tabId: resolved.tabId,
+          startIndex: resolved.startIndex,
+          endIndex: resolved.endIndex,
+          revisionId,
+          conflictMode: conflict_mode as DocsConflictMode,
+        });
+        rememberDocumentRead(document_id, result.revisionId);
+        return jsonResult({
+          documentId: document_id,
+          documentUrl: documentUrl(document_id),
+          tabId: resolved.tabId,
+          revisionId: result.revisionId,
+          deletedText: resolved.actualText,
+          deletedRange: {
+            startIndex: resolved.startIndex,
+            endIndex: resolved.endIndex,
+          },
+        });
+      } catch (err) {
+        return errorResult(err);
+      }
+    },
+  );
+
+  server.tool(
+    "gdrive_update_doc_text_style",
+    "Apply character-level formatting in a Google Doc using explicit ranges or target_text anchors. " +
+      "Supports bold, italic, underline, strikethrough, font family, font size, colors, and links.",
+    {
+      document_id: z.string().describe("Google Docs document ID"),
+      tab_id: z.string().optional().describe("Optional tab ID; defaults to the first tab"),
+      start_index: z.number().int().min(0).optional().describe("Explicit UTF-16 start index"),
+      end_index: z.number().int().min(0).optional().describe("Explicit UTF-16 end index (exclusive)"),
+      target_text: z
+        .string()
+        .optional()
+        .describe("Anchor to style this exact text match instead of passing indices"),
+      occurrence: z
+        .number()
+        .int()
+        .min(1)
+        .optional()
+        .describe("1-based match occurrence when target_text appears multiple times"),
+      match_case: z
+        .boolean()
+        .default(true)
+        .describe("Whether target_text matching is case-sensitive"),
+      bold: z.boolean().optional().describe("Bold text"),
+      italic: z.boolean().optional().describe("Italic text"),
+      underline: z.boolean().optional().describe("Underline text"),
+      strikethrough: z.boolean().optional().describe("Strikethrough text"),
+      font_family: z.string().optional().describe("Font family, e.g. 'Arial'"),
+      font_size: z.number().positive().optional().describe("Font size in points"),
+      foreground_color: docColorSchema.optional(),
+      background_color: docColorSchema.optional(),
+      link_url: z.string().url().optional().describe("Optional hyperlink URL"),
+      conflict_mode: docConflictModeSchema,
+    },
+    {
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: true,
+    } satisfies ToolAnnotations,
+    async ({
+      document_id,
+      tab_id,
+      start_index,
+      end_index,
+      target_text,
+      occurrence,
+      match_case,
+      bold,
+      italic,
+      underline,
+      strikethrough,
+      font_family,
+      font_size,
+      foreground_color,
+      background_color,
+      link_url,
+      conflict_mode,
+    }) => {
+      if (!accessedDocs.has(document_id)) {
+        return errorResult(unreadDocumentError());
+      }
+
+      const hasTextStyleUpdate =
+        bold !== undefined ||
+        italic !== undefined ||
+        underline !== undefined ||
+        strikethrough !== undefined ||
+        font_family !== undefined ||
+        font_size !== undefined ||
+        foreground_color !== undefined ||
+        background_color !== undefined ||
+        link_url !== undefined;
+      if (!hasTextStyleUpdate) {
+        return errorResult(
+          new Error("At least one text style parameter must be provided."),
+        );
+      }
+
+      try {
+        const resolved = await resolveDocumentRange({
+          documentId: document_id,
+          tabId: tab_id,
+          startIndex: start_index,
+          endIndex: end_index,
+          targetText: target_text,
+          occurrence,
+          matchCase: match_case,
+        });
+        const revisionId = await ensureDocumentRevision(document_id);
+        const result = await docsClient.updateTextStyle({
+          documentId: document_id,
+          tabId: resolved.tabId,
+          startIndex: resolved.startIndex,
+          endIndex: resolved.endIndex,
+          bold,
+          italic,
+          underline,
+          strikethrough,
+          fontFamily: font_family,
+          fontSize: font_size,
+          foregroundColor: foreground_color,
+          backgroundColor: background_color,
+          linkUrl: link_url,
+          revisionId,
+          conflictMode: conflict_mode as DocsConflictMode,
+        });
+        rememberDocumentRead(document_id, result.revisionId);
+        return jsonResult({
+          documentId: document_id,
+          documentUrl: documentUrl(document_id),
+          tabId: resolved.tabId,
+          revisionId: result.revisionId,
+          styledRange: {
+            startIndex: resolved.startIndex,
+            endIndex: resolved.endIndex,
+          },
+          targetText: resolved.actualText,
+        });
+      } catch (err) {
+        return errorResult(err);
+      }
+    },
+  );
+
+  server.tool(
+    "gdrive_update_doc_paragraph_style",
+    "Apply paragraph-level formatting in a Google Doc. Supports headings and alignment, and snaps the resolved range to full paragraph boundaries server-side.",
+    {
+      document_id: z.string().describe("Google Docs document ID"),
+      tab_id: z.string().optional().describe("Optional tab ID; defaults to the first tab"),
+      start_index: z.number().int().min(0).optional().describe("Explicit UTF-16 start index"),
+      end_index: z.number().int().min(0).optional().describe("Explicit UTF-16 end index (exclusive)"),
+      target_text: z
+        .string()
+        .optional()
+        .describe("Anchor to paragraphs overlapping this exact text match"),
+      occurrence: z
+        .number()
+        .int()
+        .min(1)
+        .optional()
+        .describe("1-based match occurrence when target_text appears multiple times"),
+      match_case: z
+        .boolean()
+        .default(true)
+        .describe("Whether target_text matching is case-sensitive"),
+      named_style_type: docNamedStyleSchema.optional(),
+      alignment: docAlignmentSchema.optional(),
+      conflict_mode: docConflictModeSchema,
+    },
+    {
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: true,
+    } satisfies ToolAnnotations,
+    async ({
+      document_id,
+      tab_id,
+      start_index,
+      end_index,
+      target_text,
+      occurrence,
+      match_case,
+      named_style_type,
+      alignment,
+      conflict_mode,
+    }) => {
+      if (!accessedDocs.has(document_id)) {
+        return errorResult(unreadDocumentError());
+      }
+
+      if (named_style_type === undefined && alignment === undefined) {
+        return errorResult(
+          new Error("At least one paragraph style parameter must be provided."),
+        );
+      }
+
+      try {
+        const resolved = await resolveDocumentRange({
+          documentId: document_id,
+          tabId: tab_id,
+          startIndex: start_index,
+          endIndex: end_index,
+          targetText: target_text,
+          occurrence,
+          matchCase: match_case,
+        });
+        const paragraphRange = snapRangeToParagraphs(
+          resolved.snapshot,
+          resolved.startIndex,
+          resolved.endIndex,
+        );
+        const revisionId = await ensureDocumentRevision(document_id);
+        const result = await docsClient.updateParagraphStyle({
+          documentId: document_id,
+          tabId: resolved.tabId,
+          startIndex: paragraphRange.startIndex,
+          endIndex: paragraphRange.endIndex,
+          namedStyleType: named_style_type as DocNamedStyleType | undefined,
+          alignment: alignment as DocParagraphAlignment | undefined,
+          revisionId,
+          conflictMode: conflict_mode as DocsConflictMode,
+        });
+        rememberDocumentRead(document_id, result.revisionId);
+        return jsonResult({
+          documentId: document_id,
+          documentUrl: documentUrl(document_id),
+          tabId: resolved.tabId,
+          revisionId: result.revisionId,
+          paragraphRange,
+          namedStyleType: named_style_type,
+          alignment,
+        });
+      } catch (err) {
+        return errorResult(err);
+      }
+    },
+  );
+
+  server.tool(
+    "gdrive_update_doc_list",
+    "Create, change, or remove list formatting in a Google Doc. The resolved range is snapped to full paragraph boundaries server-side.",
+    {
+      document_id: z.string().describe("Google Docs document ID"),
+      tab_id: z.string().optional().describe("Optional tab ID; defaults to the first tab"),
+      start_index: z.number().int().min(0).optional().describe("Explicit UTF-16 start index"),
+      end_index: z.number().int().min(0).optional().describe("Explicit UTF-16 end index (exclusive)"),
+      target_text: z
+        .string()
+        .optional()
+        .describe("Anchor to paragraphs overlapping this exact text match"),
+      occurrence: z
+        .number()
+        .int()
+        .min(1)
+        .optional()
+        .describe("1-based match occurrence when target_text appears multiple times"),
+      match_case: z
+        .boolean()
+        .default(true)
+        .describe("Whether target_text matching is case-sensitive"),
+      preset: docListPresetSchema,
+      conflict_mode: docConflictModeSchema,
+    },
+    {
+      readOnlyHint: false,
+      destructiveHint: true,
+      idempotentHint: true,
+      openWorldHint: true,
+    } satisfies ToolAnnotations,
+    async ({
+      document_id,
+      tab_id,
+      start_index,
+      end_index,
+      target_text,
+      occurrence,
+      match_case,
+      preset,
+      conflict_mode,
+    }) => {
+      if (!accessedDocs.has(document_id)) {
+        return errorResult(unreadDocumentError());
+      }
+
+      try {
+        const resolved = await resolveDocumentRange({
+          documentId: document_id,
+          tabId: tab_id,
+          startIndex: start_index,
+          endIndex: end_index,
+          targetText: target_text,
+          occurrence,
+          matchCase: match_case,
+        });
+        const paragraphRange = snapRangeToParagraphs(
+          resolved.snapshot,
+          resolved.startIndex,
+          resolved.endIndex,
+        );
+        const revisionId = await ensureDocumentRevision(document_id);
+        const result = await docsClient.updateList({
+          documentId: document_id,
+          tabId: resolved.tabId,
+          startIndex: paragraphRange.startIndex,
+          endIndex: paragraphRange.endIndex,
+          preset: preset as DocListPreset,
+          revisionId,
+          conflictMode: conflict_mode as DocsConflictMode,
+        });
+        rememberDocumentRead(document_id, result.revisionId);
+        return jsonResult({
+          documentId: document_id,
+          documentUrl: documentUrl(document_id),
+          tabId: resolved.tabId,
+          revisionId: result.revisionId,
+          paragraphRange,
+          preset,
+        });
+      } catch (err) {
+        return errorResult(err);
+      }
+    },
+  );
+
+  // ── Write tools — Docs file operations ─────────────────────────────
+
+  server.tool(
+    "gdrive_rename_doc",
+    "Rename an existing Google Doc file. This is a Drive file operation, not a Docs content edit.",
+    {
+      document_id: z.string().describe("Google Docs document ID"),
+      new_title: z.string().describe("New document title"),
+    },
+    {
+      readOnlyHint: false,
+      destructiveHint: true,
+      idempotentHint: false,
+      openWorldHint: true,
+    } satisfies ToolAnnotations,
+    async ({ document_id, new_title }) => {
+      if (!accessedDocs.has(document_id)) {
+        return errorResult(unreadDocumentError());
+      }
+
+      try {
+        const result = await docsClient.renameDocument(document_id, new_title);
+        return jsonResult(result);
+      } catch (err) {
+        return errorResult(err);
+      }
+    },
+  );
+
+  server.tool(
+    "gdrive_duplicate_doc",
+    "Duplicate an existing Google Doc. When folder_id is omitted, the copy keeps the source document's parent folder placement.",
+    {
+      document_id: z.string().describe("Google Docs document ID"),
+      new_title: z.string().optional().describe("Optional title for the copied document"),
+      folder_id: z
+        .string()
+        .optional()
+        .describe("Optional destination folder ID for the copy"),
+    },
+    {
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: true,
+    } satisfies ToolAnnotations,
+    async ({ document_id, new_title, folder_id }) => {
+      if (!accessedDocs.has(document_id)) {
+        return errorResult(unreadDocumentError());
+      }
+
+      try {
+        const result = await docsClient.duplicateDocument(document_id, new_title, folder_id);
+        rememberDocumentRead(result.documentId, result.revisionId);
+        return jsonResult(result);
       } catch (err) {
         return errorResult(err);
       }
