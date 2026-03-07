@@ -306,13 +306,16 @@ export function createServer(
     {
       spreadsheet_id: z.string().describe("Google Sheets spreadsheet ID"),
       range: z.string().describe("A1 notation, e.g. 'Sheet1!A1:C3'"),
-      values: ValuesArray.describe("2D array of rows — each cell is a string, number, or boolean"),
+      values: ValuesArray.describe(
+        "2D array of cell values, e.g. [[\"Name\",\"Age\"],[\"Alice\",30]]. " +
+          "Each inner array is one row; cells can be strings, numbers, or booleans.",
+      ),
       value_input_option: z
         .enum(["USER_ENTERED", "RAW"])
         .default("USER_ENTERED")
         .describe("USER_ENTERED parses formulas/dates; RAW stores literally"),
       expected_current_values: ValuesArray.optional().describe(
-        "Expected current cell values (same shape as values). " +
+        "Expected current cell values (same shape as values), e.g. [[\"old\"]]. " +
           "If provided, the write is refused when actual values differ. Use for small targeted edits.",
       ),
       include_previous_values: z
