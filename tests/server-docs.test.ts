@@ -60,6 +60,10 @@ function getTools(server: ReturnType<typeof createServer>) {
   return (server as any)._registeredTools as Record<string, any>;
 }
 
+function parseToolResult<T>(result: { content: Array<{ text: string }> }): T {
+  return JSON.parse(result.content[0].text) as T;
+}
+
 function makeDocumentMetadata(revisionId: string = "rev-1"): NormalizedDocument {
   return {
     documentId: "doc1",
@@ -101,6 +105,7 @@ function makeDocumentContent(revisionId: string = "rev-1"): NormalizedDocument {
           {
             startIndex: 1,
             endIndex: 7,
+            displayText: "Hello",
             text: "Hello\n",
             list: null,
             elements: [
@@ -116,6 +121,7 @@ function makeDocumentContent(revisionId: string = "rev-1"): NormalizedDocument {
           {
             startIndex: 7,
             endIndex: 13,
+            displayText: "Hello",
             text: "Hello\n",
             list: null,
             elements: [
@@ -139,6 +145,7 @@ function makeDocumentContent(revisionId: string = "rev-1"): NormalizedDocument {
           {
             startIndex: 1,
             endIndex: 15,
+            displayText: "Status: Draft",
             text: "Status: Draft\n",
             list: null,
             elements: [
@@ -177,6 +184,7 @@ function makeBlankDocumentContent(
           {
             startIndex: 0,
             endIndex: 1,
+            displayText: "",
             text: "",
             list: null,
             elements: [
@@ -191,6 +199,7 @@ function makeBlankDocumentContent(
           {
             startIndex: 1,
             endIndex: 2,
+            displayText: "",
             text: "\n",
             list: null,
             elements: [
@@ -199,6 +208,76 @@ function makeBlankDocumentContent(
                 startIndex: 1,
                 endIndex: 2,
                 text: "\n",
+                textStyle: null,
+              },
+            ],
+          },
+        ],
+      },
+    ],
+  };
+}
+
+function makeThreeParagraphDocumentContent(
+  revisionId: string = "rev-1",
+): NormalizedDocument {
+  return {
+    documentId: "doc1",
+    title: "Doc",
+    documentUrl: "https://docs.google.com/document/d/doc1/edit",
+    revisionId,
+    contentTruncated: false,
+    tabs: [
+      {
+        tabId: "tab-1",
+        title: "Main",
+        index: 0,
+        nestingLevel: 0,
+        paragraphs: [
+          {
+            startIndex: 1,
+            endIndex: 10,
+            displayText: "line one",
+            text: "line one\n",
+            list: null,
+            elements: [
+              {
+                type: "textRun",
+                startIndex: 1,
+                endIndex: 10,
+                text: "line one\n",
+                textStyle: null,
+              },
+            ],
+          },
+          {
+            startIndex: 10,
+            endIndex: 19,
+            displayText: "line two",
+            text: "line two\n",
+            list: null,
+            elements: [
+              {
+                type: "textRun",
+                startIndex: 10,
+                endIndex: 19,
+                text: "line two\n",
+                textStyle: null,
+              },
+            ],
+          },
+          {
+            startIndex: 19,
+            endIndex: 24,
+            displayText: "tail",
+            text: "tail\n",
+            list: null,
+            elements: [
+              {
+                type: "textRun",
+                startIndex: 19,
+                endIndex: 24,
+                text: "tail\n",
                 textStyle: null,
               },
             ],
@@ -604,6 +683,277 @@ describe("Docs server behavior", () => {
         endIndex: 6,
       }),
     );
+  });
+
+  it("auto-trims the terminal newline for anchored replacements", async () => {
+    const { server, docs } = makeServer();
+    const tools = getTools(server);
+
+    (docs.getDocument as ReturnType<typeof vi.fn>).mockResolvedValueOnce(
+      makeDocumentContent(),
+    );
+    (docs.replaceText as ReturnType<typeof vi.fn>).mockResolvedValue({
+      documentId: "doc1",
+      revisionId: "rev-2",
+    });
+
+    await tools["gdrive_get_document_info"].handler(
+      { document_id: "doc1", include_content: true, tab_id: "tab-1", max_chars: 20_000, max_paragraphs: 200 },
+      {},
+    );
+
+    (docs.getDocument as ReturnType<typeof vi.fn>).mockClear();
+    (docs.getDocument as ReturnType<typeof vi.fn>).mockResolvedValue(
+      makeDocumentMetadata(),
+    );
+
+    const result = await tools["gdrive_replace_doc_text"].handler(
+      {
+        document_id: "doc1",
+        tab_id: "tab-1",
+        target_text: "Hello\n",
+        occurrence: 2,
+        replacement_text: "Hi",
+        match_case: true,
+        conflict_mode: "strict",
+      },
+      {},
+    );
+
+    const payload = parseToolResult<{
+      previousText: string;
+      replacedRange: { startIndex: number; endIndex: number };
+      warnings?: string[];
+    }>(result);
+
+    expect(result.isError).toBeUndefined();
+    expect(docs.replaceText).toHaveBeenCalledWith(
+      expect.objectContaining({
+        startIndex: 7,
+        endIndex: 12,
+      }),
+    );
+    expect(payload.previousText).toBe("Hello");
+    expect(payload.replacedRange).toEqual({ startIndex: 7, endIndex: 12 });
+    expect(payload.warnings?.[0]).toContain("Excluded the trailing paragraph newline");
+  });
+
+  it("auto-trims the terminal newline for anchored deletes", async () => {
+    const { server, docs } = makeServer();
+    const tools = getTools(server);
+
+    (docs.getDocument as ReturnType<typeof vi.fn>).mockResolvedValueOnce(
+      makeDocumentContent(),
+    );
+    (docs.deleteText as ReturnType<typeof vi.fn>).mockResolvedValue({
+      documentId: "doc1",
+      revisionId: "rev-2",
+    });
+
+    await tools["gdrive_get_document_info"].handler(
+      { document_id: "doc1", include_content: true, tab_id: "tab-1", max_chars: 20_000, max_paragraphs: 200 },
+      {},
+    );
+
+    (docs.getDocument as ReturnType<typeof vi.fn>).mockClear();
+    (docs.getDocument as ReturnType<typeof vi.fn>).mockResolvedValue(
+      makeDocumentMetadata(),
+    );
+
+    const result = await tools["gdrive_delete_doc_text"].handler(
+      {
+        document_id: "doc1",
+        tab_id: "tab-1",
+        target_text: "Hello\n",
+        occurrence: 2,
+        match_case: true,
+        conflict_mode: "strict",
+      },
+      {},
+    );
+
+    const payload = parseToolResult<{
+      deletedText: string;
+      deletedRange: { startIndex: number; endIndex: number };
+      warnings?: string[];
+    }>(result);
+
+    expect(result.isError).toBeUndefined();
+    expect(docs.deleteText).toHaveBeenCalledWith(
+      expect.objectContaining({
+        startIndex: 7,
+        endIndex: 12,
+      }),
+    );
+    expect(payload.deletedText).toBe("Hello");
+    expect(payload.deletedRange).toEqual({ startIndex: 7, endIndex: 12 });
+    expect(payload.warnings?.[0]).toContain("Excluded the trailing paragraph newline");
+  });
+
+  it("rewrites Docs terminal-newline API errors into actionable guidance", async () => {
+    const { server, docs } = makeServer();
+    const tools = getTools(server);
+
+    (docs.getDocument as ReturnType<typeof vi.fn>).mockResolvedValueOnce(
+      makeDocumentContent(),
+    );
+    (docs.deleteText as ReturnType<typeof vi.fn>).mockRejectedValue(
+      new Error(
+        "Bad request — check your query parameters. Google says: Invalid requests[0].deleteContentRange: The range cannot include the newline character at the end of the segment.",
+      ),
+    );
+
+    await tools["gdrive_get_document_info"].handler(
+      { document_id: "doc1", include_content: true, tab_id: "tab-1", max_chars: 20_000, max_paragraphs: 200 },
+      {},
+    );
+
+    (docs.getDocument as ReturnType<typeof vi.fn>).mockClear();
+    (docs.getDocument as ReturnType<typeof vi.fn>).mockResolvedValue(
+      makeDocumentMetadata(),
+    );
+
+    const result = await tools["gdrive_delete_doc_text"].handler(
+      {
+        document_id: "doc1",
+        tab_id: "tab-1",
+        target_text: "Hello",
+        occurrence: 1,
+        match_case: true,
+        conflict_mode: "strict",
+      },
+      {},
+    );
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain(
+      "Google Docs rejected the edit because the requested range included the final paragraph newline of the current tab.",
+    );
+    expect(result.content[0].text).toContain("paragraph.displayText");
+  });
+
+  it("keeps internal paragraph newlines when the match does not reach the segment end", async () => {
+    const { server, docs } = makeServer();
+    const tools = getTools(server);
+
+    (docs.getDocument as ReturnType<typeof vi.fn>).mockResolvedValueOnce(
+      makeThreeParagraphDocumentContent(),
+    );
+    (docs.replaceText as ReturnType<typeof vi.fn>).mockResolvedValue({
+      documentId: "doc1",
+      revisionId: "rev-2",
+    });
+
+    await tools["gdrive_get_document_info"].handler(
+      { document_id: "doc1", include_content: true, tab_id: "tab-1", max_chars: 20_000, max_paragraphs: 200 },
+      {},
+    );
+
+    (docs.getDocument as ReturnType<typeof vi.fn>).mockClear();
+    (docs.getDocument as ReturnType<typeof vi.fn>).mockResolvedValue(
+      makeDocumentMetadata(),
+    );
+
+    const result = await tools["gdrive_replace_doc_text"].handler(
+      {
+        document_id: "doc1",
+        tab_id: "tab-1",
+        target_text: "line one\nline two\n",
+        occurrence: 1,
+        replacement_text: "merged text",
+        match_case: true,
+        conflict_mode: "strict",
+      },
+      {},
+    );
+
+    const payload = parseToolResult<{
+      previousText: string;
+      replacedRange: { startIndex: number; endIndex: number };
+      warnings?: string[];
+    }>(result);
+
+    expect(result.isError).toBeUndefined();
+    expect(docs.replaceText).toHaveBeenCalledWith(
+      expect.objectContaining({
+        startIndex: 1,
+        endIndex: 19,
+      }),
+    );
+    expect(payload.previousText).toBe("line one\nline two\n");
+    expect(payload.replacedRange).toEqual({ startIndex: 1, endIndex: 19 });
+    expect(payload.warnings).toBeUndefined();
+  });
+
+  it("rejects explicit replacement ranges that include the terminal newline", async () => {
+    const { server, docs } = makeServer();
+    const tools = getTools(server);
+
+    (docs.getDocument as ReturnType<typeof vi.fn>).mockResolvedValueOnce(
+      makeDocumentContent(),
+    );
+
+    await tools["gdrive_get_document_info"].handler(
+      { document_id: "doc1", include_content: true, tab_id: "tab-1", max_chars: 20_000, max_paragraphs: 200 },
+      {},
+    );
+
+    (docs.getDocument as ReturnType<typeof vi.fn>).mockClear();
+    (docs.getDocument as ReturnType<typeof vi.fn>).mockResolvedValue(
+      makeDocumentMetadata(),
+    );
+
+    const result = await tools["gdrive_replace_doc_text"].handler(
+      {
+        document_id: "doc1",
+        tab_id: "tab-1",
+        start_index: 7,
+        end_index: 13,
+        replacement_text: "Hi",
+        match_case: true,
+        conflict_mode: "strict",
+      },
+      {},
+    );
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("Adjust `end_index`");
+    expect(docs.replaceText).not.toHaveBeenCalled();
+  });
+
+  it("rejects explicit delete ranges that include the terminal newline", async () => {
+    const { server, docs } = makeServer();
+    const tools = getTools(server);
+
+    (docs.getDocument as ReturnType<typeof vi.fn>).mockResolvedValueOnce(
+      makeDocumentContent(),
+    );
+
+    await tools["gdrive_get_document_info"].handler(
+      { document_id: "doc1", include_content: true, tab_id: "tab-1", max_chars: 20_000, max_paragraphs: 200 },
+      {},
+    );
+
+    (docs.getDocument as ReturnType<typeof vi.fn>).mockClear();
+    (docs.getDocument as ReturnType<typeof vi.fn>).mockResolvedValue(
+      makeDocumentMetadata(),
+    );
+
+    const result = await tools["gdrive_delete_doc_text"].handler(
+      {
+        document_id: "doc1",
+        tab_id: "tab-1",
+        start_index: 7,
+        end_index: 13,
+        match_case: true,
+        conflict_mode: "strict",
+      },
+      {},
+    );
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("Adjust `end_index`");
+    expect(docs.deleteText).not.toHaveBeenCalled();
   });
 
   it("reuses cached structured content for anchor resolution when the revision still matches", async () => {

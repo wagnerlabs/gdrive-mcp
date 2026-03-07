@@ -21,6 +21,8 @@ const SAFE: ToolAnnotations = {
 };
 
 const DOC_PLACEHOLDER_CHAR = "\uFFFC";
+const DOC_TERMINAL_NEWLINE_WARNING =
+  "Excluded the trailing paragraph newline from the resolved range because Google Docs cannot delete the final newline of a segment.";
 const HEX_COLOR_PATTERN = /^#?[0-9A-Fa-f]{6}$/;
 
 function errorResult(err: unknown): {
@@ -130,6 +132,7 @@ interface ResolvedDocumentRange {
   startIndex: number;
   endIndex: number;
   actualText: string;
+  targetMode: "anchor" | "explicit";
   snapshot: CachedDocumentTabContent;
 }
 
@@ -367,6 +370,83 @@ export function createServer(
     }
   }
 
+  // This helper is body/tab scoped today. If we later support headers,
+  // footers, or footnotes, terminal newline detection needs to become
+  // segment-aware rather than assuming the last paragraph in the tab body.
+  function segmentTerminalNewlineIndex(
+    snapshot: CachedDocumentTabContent,
+  ): number | undefined {
+    const paragraphs = snapshot.tab.paragraphs ?? [];
+    const lastParagraph = paragraphs[paragraphs.length - 1];
+    if (!lastParagraph?.text.endsWith("\n")) {
+      return undefined;
+    }
+    return lastParagraph.endIndex - 1;
+  }
+
+  function rangeIncludesSegmentTerminalNewline(
+    resolved: ResolvedDocumentRange,
+  ): boolean {
+    const terminalNewlineIndex = segmentTerminalNewlineIndex(resolved.snapshot);
+    return (
+      terminalNewlineIndex !== undefined &&
+      resolved.endIndex === terminalNewlineIndex + 1 &&
+      resolved.actualText.endsWith("\n")
+    );
+  }
+
+  function terminalNewlineEditError(targetMode: ResolvedDocumentRange["targetMode"]): Error {
+    const guidance =
+      targetMode === "anchor"
+        ? 'Retry with `target_text` that matches `paragraph.displayText`, or omit the trailing "\\n".'
+        : 'Adjust `end_index` to exclude the trailing "\\n".';
+    return new Error(
+      "Google Docs does not allow deleting or replacing the final paragraph newline of the current tab. " +
+        guidance,
+    );
+  }
+
+  function normalizeRangeForTextMutation(resolved: ResolvedDocumentRange): {
+    startIndex: number;
+    endIndex: number;
+    actualText: string;
+    warnings?: string[];
+  } {
+    if (!rangeIncludesSegmentTerminalNewline(resolved)) {
+      return {
+        startIndex: resolved.startIndex,
+        endIndex: resolved.endIndex,
+        actualText: resolved.actualText,
+      };
+    }
+
+    const trimmedEndIndex = resolved.endIndex - 1;
+    if (resolved.targetMode !== "anchor" || trimmedEndIndex <= resolved.startIndex) {
+      throw terminalNewlineEditError(resolved.targetMode);
+    }
+
+    return {
+      startIndex: resolved.startIndex,
+      endIndex: trimmedEndIndex,
+      actualText: resolved.actualText.slice(0, -1),
+      warnings: [DOC_TERMINAL_NEWLINE_WARNING],
+    };
+  }
+
+  function rewriteTerminalNewlineMutationError(err: unknown): unknown {
+    const message = err instanceof Error ? err.message : String(err);
+    if (
+      message.includes("deleteContentRange") &&
+      message.includes("newline character at the end of the segment")
+    ) {
+      return new Error(
+        'Google Docs rejected the edit because the requested range included the final paragraph newline of the current tab. ' +
+          'Use `paragraph.displayText` or omit the trailing "\\n" in `target_text`, or adjust `end_index` to exclude it.',
+      );
+    }
+    return err;
+  }
+
   // Brand-new Docs can expose a non-text placeholder paragraph at index 0.
   function firstInsertableTextIndex(snapshot: CachedDocumentTabContent): number | undefined {
     for (const paragraph of snapshot.tab.paragraphs ?? []) {
@@ -489,6 +569,7 @@ export function createServer(
         startIndex: options.startIndex,
         endIndex: options.endIndex,
         actualText,
+        targetMode: "explicit",
         snapshot,
       };
     }
@@ -541,6 +622,7 @@ export function createServer(
       startIndex,
       endIndex,
       actualText,
+      targetMode: "anchor",
       snapshot,
     };
   }
@@ -805,6 +887,7 @@ export function createServer(
     "Get structured Google Docs metadata and optional tab-scoped content. " +
       "By default this is metadata-first so large documents stay compact. " +
       "Set include_content=true to retrieve paragraph-level content for one tab or all tabs. " +
+      "Paragraphs include both raw `text` and anchor-friendly `displayText` (without a trailing paragraph newline). " +
       "Example: {\"document_id\":\"doc123\",\"include_content\":true,\"tab_id\":\"tab-1\",\"max_chars\":12000,\"max_paragraphs\":80}.",
     {
       document_id: z.string().describe("Google Docs document ID"),
@@ -1583,7 +1666,9 @@ export function createServer(
       target_text: z
         .string()
         .optional()
-        .describe("Anchor to replace this exact text match instead of passing indices"),
+        .describe(
+          "Anchor to replace this exact text match instead of passing indices. Prefer `paragraph.displayText` from gdrive_get_document_info; raw paragraph text may include a trailing newline.",
+        ),
       occurrence: z
         .number()
         .int()
@@ -1633,13 +1718,14 @@ export function createServer(
           matchCase: match_case,
           expectedText: expected_text,
         });
+        const normalized = normalizeRangeForTextMutation(resolved);
         const revisionId = await ensureDocumentRevision(document_id);
         const result = await docsClient.replaceText({
           documentId: document_id,
           text: replacement_text,
           tabId: resolved.tabId,
-          startIndex: resolved.startIndex,
-          endIndex: resolved.endIndex,
+          startIndex: normalized.startIndex,
+          endIndex: normalized.endIndex,
           revisionId,
           conflictMode: conflict_mode as DocsConflictMode,
         });
@@ -1649,15 +1735,16 @@ export function createServer(
           documentUrl: documentUrl(document_id),
           tabId: resolved.tabId,
           revisionId: result.revisionId,
-          previousText: resolved.actualText,
+          previousText: normalized.actualText,
           replacementText: replacement_text,
           replacedRange: {
-            startIndex: resolved.startIndex,
-            endIndex: resolved.endIndex,
+            startIndex: normalized.startIndex,
+            endIndex: normalized.endIndex,
           },
+          warnings: normalized.warnings,
         });
       } catch (err) {
-        return errorResult(err);
+        return errorResult(rewriteTerminalNewlineMutationError(err));
       }
     },
   );
@@ -1747,7 +1834,9 @@ export function createServer(
       target_text: z
         .string()
         .optional()
-        .describe("Anchor to delete this exact text match instead of passing indices"),
+        .describe(
+          "Anchor to delete this exact text match instead of passing indices. Prefer `paragraph.displayText` from gdrive_get_document_info; raw paragraph text may include a trailing newline.",
+        ),
       occurrence: z
         .number()
         .int()
@@ -1796,12 +1885,13 @@ export function createServer(
           matchCase: match_case,
           expectedText: expected_text,
         });
+        const normalized = normalizeRangeForTextMutation(resolved);
         const revisionId = await ensureDocumentRevision(document_id);
         const result = await docsClient.deleteText({
           documentId: document_id,
           tabId: resolved.tabId,
-          startIndex: resolved.startIndex,
-          endIndex: resolved.endIndex,
+          startIndex: normalized.startIndex,
+          endIndex: normalized.endIndex,
           revisionId,
           conflictMode: conflict_mode as DocsConflictMode,
         });
@@ -1811,14 +1901,15 @@ export function createServer(
           documentUrl: documentUrl(document_id),
           tabId: resolved.tabId,
           revisionId: result.revisionId,
-          deletedText: resolved.actualText,
+          deletedText: normalized.actualText,
           deletedRange: {
-            startIndex: resolved.startIndex,
-            endIndex: resolved.endIndex,
+            startIndex: normalized.startIndex,
+            endIndex: normalized.endIndex,
           },
+          warnings: normalized.warnings,
         });
       } catch (err) {
-        return errorResult(err);
+        return errorResult(rewriteTerminalNewlineMutationError(err));
       }
     },
   );

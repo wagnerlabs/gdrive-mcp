@@ -119,6 +119,7 @@ describe("DocsClient.getDocument", () => {
     );
     expect(result.tabs[0].paragraphs?.[0]).toEqual(
       expect.objectContaining({
+        displayText: "Hello",
         text: "Hello\n",
         namedStyleType: "HEADING_1",
         alignment: "CENTER",

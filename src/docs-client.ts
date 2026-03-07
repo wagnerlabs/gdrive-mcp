@@ -53,6 +53,11 @@ export type NormalizedDocElement =
 export interface NormalizedDocParagraph {
   startIndex: number;
   endIndex: number;
+  // `displayText` omits the trailing paragraph newline so agents can safely
+  // round-trip it into anchor-based write tools.
+  displayText: string;
+  // `text` preserves the raw Docs paragraph text, including a trailing newline
+  // when present, so index arithmetic and structured snapshots stay faithful.
   text: string;
   namedStyleType?: DocNamedStyleType;
   alignment?: DocParagraphAlignment;
@@ -201,6 +206,10 @@ function documentUrl(documentId: string): string {
   return `https://docs.google.com/document/d/${documentId}/edit`;
 }
 
+function paragraphDisplayText(text: string): string {
+  return text.endsWith("\n") ? text.slice(0, -1) : text;
+}
+
 function buildMetadataTabFields(depth: number): string {
   const current = "tabProperties";
   if (depth <= 0) {
@@ -210,6 +219,9 @@ function buildMetadataTabFields(depth: number): string {
 }
 
 function buildContentTabFields(depth: number): string {
+  // Request the full `lists` object here. Narrower nested list field masks are
+  // brittle in tab-aware Docs reads, while the full object keeps list
+  // normalization stable across includeTabsContent responses.
   const current = [
     "tabProperties",
     "documentTab(body(content(startIndex,endIndex,paragraph(elements(startIndex,endIndex,textRun(content,textStyle),autoText(type,textStyle),pageBreak(textStyle),columnBreak(textStyle),footnoteReference,horizontalRule,equation,inlineObjectElement,person,richLink),paragraphStyle(namedStyleType,alignment),bullet(listId,nestingLevel,textStyle)),sectionBreak,table,tableOfContents)),lists)",
@@ -771,6 +783,7 @@ export class DocsClient {
       return {
         startIndex,
         endIndex,
+        displayText: "",
         text: "",
         list: null,
         elements: [
@@ -828,6 +841,7 @@ export class DocsClient {
     return {
       startIndex,
       endIndex,
+      displayText: paragraphDisplayText(text),
       text,
       namedStyleType: paragraph.paragraphStyle?.namedStyleType as
         | DocNamedStyleType

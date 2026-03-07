@@ -171,7 +171,7 @@ When reading files with `gdrive_read_file`, Google Workspace documents are autom
 
 For full spreadsheet access (all tabs, structured data, editing), use `gdrive_get_spreadsheet_info` and the Sheets write tools instead of `gdrive_read_file`.
 
-For structured Google Docs reads, paragraph-aware formatting, headings, lists, alignment, and anchor-based edits, use `gdrive_get_document_info` plus the Docs write tools. `gdrive_read_file` still remains the fastest way to read a Doc as Markdown.
+For structured Google Docs reads, paragraph-aware formatting, headings, lists, alignment, and anchor-based edits, use `gdrive_get_document_info` plus the Docs write tools. Structured paragraph responses include both raw `text` and `displayText` without the trailing paragraph newline, which is usually the safer anchor to round-trip back into Docs write tools. `gdrive_read_file` still remains the fastest way to read a Doc as Markdown.
 
 ## Safety model
 
@@ -217,6 +217,8 @@ Docs edits are tied to the revision the agent most recently read:
 The server also maintains a small session-scoped structured-content cache from `gdrive_get_document_info include_content=true`. Anchor-based tools such as `gdrive_insert_doc_text`, `gdrive_replace_doc_text`, `gdrive_update_doc_paragraph_style`, and `gdrive_update_doc_list` reuse that cache when the document revision still matches; otherwise the server fetches a fresh structured snapshot before resolving anchors.
 
 For targeted Docs text edits, you can also pass `expected_text` as an optimistic safety check. This verifies the exact text in the resolved range before the write is sent.
+
+For anchor-based `gdrive_delete_doc_text` and `gdrive_replace_doc_text`, the server automatically trims only the final paragraph newline when a match reaches the end of the current tab, because the Docs API rejects delete ranges that include the segment-terminal newline. Explicit `start_index` / `end_index` edits stay strict and must exclude that trailing newline themselves.
 
 ### 4. Sheets precondition check
 
