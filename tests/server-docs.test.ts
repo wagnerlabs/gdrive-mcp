@@ -157,6 +157,58 @@ function makeDocumentContent(revisionId: string = "rev-1"): NormalizedDocument {
   };
 }
 
+function makeBlankDocumentContent(
+  documentId: string = "doc1",
+  revisionId: string = "rev-1",
+): NormalizedDocument {
+  return {
+    documentId,
+    title: "Doc",
+    documentUrl: `https://docs.google.com/document/d/${documentId}/edit`,
+    revisionId,
+    contentTruncated: false,
+    tabs: [
+      {
+        tabId: "tab-1",
+        title: "Main",
+        index: 0,
+        nestingLevel: 0,
+        paragraphs: [
+          {
+            startIndex: 0,
+            endIndex: 1,
+            text: "",
+            list: null,
+            elements: [
+              {
+                type: "placeholder",
+                startIndex: 0,
+                endIndex: 1,
+                placeholderKind: "other",
+              },
+            ],
+          },
+          {
+            startIndex: 1,
+            endIndex: 2,
+            text: "\n",
+            list: null,
+            elements: [
+              {
+                type: "textRun",
+                startIndex: 1,
+                endIndex: 2,
+                text: "\n",
+                textStyle: null,
+              },
+            ],
+          },
+        ],
+      },
+    ],
+  };
+}
+
 describe("Docs server behavior", () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -369,6 +421,86 @@ describe("Docs server behavior", () => {
         atEnd: true,
       }),
     );
+  });
+
+  it("resolves position:start on a blank doc to the first editable text index", async () => {
+    const { server, docs } = makeServer();
+    const tools = getTools(server);
+
+    (docs.createDocument as ReturnType<typeof vi.fn>).mockResolvedValue({
+      documentId: "new-doc",
+      title: "New Doc",
+      documentUrl: "https://docs.google.com/document/d/new-doc/edit",
+      revisionId: "rev-new",
+      folderId: "root",
+    });
+    (docs.getDocument as ReturnType<typeof vi.fn>).mockResolvedValue(
+      makeBlankDocumentContent("new-doc", "rev-new"),
+    );
+    (docs.insertText as ReturnType<typeof vi.fn>).mockResolvedValue({
+      documentId: "new-doc",
+      revisionId: "rev-next",
+    });
+
+    await tools["gdrive_create_doc"].handler(
+      { title: "New Doc", folder_id: "root" },
+      {},
+    );
+    const result = await tools["gdrive_insert_doc_text"].handler(
+      {
+        document_id: "new-doc",
+        text: "Hello",
+        position: "start",
+        match_case: true,
+        conflict_mode: "strict",
+      },
+      {},
+    );
+
+    expect(result.isError).toBeUndefined();
+    expect(docs.insertText).toHaveBeenCalledWith(
+      expect.objectContaining({
+        documentId: "new-doc",
+        revisionId: "rev-new",
+        index: 1,
+        atEnd: false,
+      }),
+    );
+  });
+
+  it("rejects raw insertion indices outside editable text runs", async () => {
+    const { server, docs } = makeServer();
+    const tools = getTools(server);
+
+    (docs.createDocument as ReturnType<typeof vi.fn>).mockResolvedValue({
+      documentId: "new-doc",
+      title: "New Doc",
+      documentUrl: "https://docs.google.com/document/d/new-doc/edit",
+      revisionId: "rev-new",
+      folderId: "root",
+    });
+    (docs.getDocument as ReturnType<typeof vi.fn>).mockResolvedValue(
+      makeBlankDocumentContent("new-doc", "rev-new"),
+    );
+
+    await tools["gdrive_create_doc"].handler(
+      { title: "New Doc", folder_id: "root" },
+      {},
+    );
+    const result = await tools["gdrive_insert_doc_text"].handler(
+      {
+        document_id: "new-doc",
+        text: "Hello",
+        index: 0,
+        match_case: true,
+        conflict_mode: "strict",
+      },
+      {},
+    );
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("editable text paragraph");
+    expect(docs.insertText).not.toHaveBeenCalled();
   });
 
   it("replace_all defaults to the first tab and supports explicit all-tabs mode", async () => {

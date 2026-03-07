@@ -367,6 +367,32 @@ export function createServer(
     }
   }
 
+  // Brand-new Docs can expose a non-text placeholder paragraph at index 0.
+  function firstInsertableTextIndex(snapshot: CachedDocumentTabContent): number | undefined {
+    for (const paragraph of snapshot.tab.paragraphs ?? []) {
+      for (const element of paragraph.elements) {
+        if (element.type === "textRun" && element.startIndex < element.endIndex) {
+          return element.startIndex;
+        }
+      }
+    }
+    return undefined;
+  }
+
+  function isValidInsertionIndex(
+    snapshot: CachedDocumentTabContent,
+    index: number,
+  ): boolean {
+    return (snapshot.tab.paragraphs ?? []).some((paragraph) =>
+      paragraph.elements.some(
+        (element) =>
+          element.type === "textRun" &&
+          index >= element.startIndex &&
+          index < element.endIndex,
+      ),
+    );
+  }
+
   async function getStructuredDocumentTab(
     documentId: string,
     requestedTabId?: string,
@@ -544,12 +570,11 @@ export function createServer(
 
     if (options.index !== undefined) {
       const snapshot = await getStructuredDocumentTab(options.documentId, options.tabId);
-      const lowerBound = snapshot.baseIndex;
-      const upperBound = snapshot.baseIndex + snapshot.searchableText.length;
-      if (options.index < lowerBound || options.index > upperBound) {
+      if (!isValidInsertionIndex(snapshot, options.index)) {
         throw new Error(
-          `Insertion index ${options.index} is outside the current tab content. ` +
-            "Use gdrive_get_document_info include_content=true to inspect valid indices.",
+          `Insertion index ${options.index} is not inside an editable text paragraph. ` +
+            "Use gdrive_get_document_info include_content=true to inspect valid indices, " +
+            "or prefer position:'end' for a blank/newly created doc.",
         );
       }
       return { tabId: snapshot.tabId, index: options.index, atEnd: false };
@@ -562,10 +587,13 @@ export function createServer(
 
     if (options.position === "start") {
       const snapshot = await getStructuredDocumentTab(options.documentId, options.tabId);
-      const firstParagraph = snapshot.tab.paragraphs?.[0];
+      const firstIndex = firstInsertableTextIndex(snapshot);
+      if (firstIndex === undefined) {
+        return { tabId: snapshot.tabId, atEnd: true };
+      }
       return {
         tabId: snapshot.tabId,
-        index: firstParagraph?.startIndex ?? snapshot.baseIndex,
+        index: firstIndex,
         atEnd: false,
       };
     }
@@ -1446,8 +1474,9 @@ export function createServer(
 
   server.tool(
     "gdrive_insert_doc_text",
-    "Insert text into an existing Google Doc. Prefer position:'start'|'end' or before_text/after_text anchors instead of raw indices when possible. " +
-      "Examples: {\"document_id\":\"doc123\",\"position\":\"end\",\"text\":\"\\nSummary\"} or {\"document_id\":\"doc123\",\"before_text\":\"TODO\",\"occurrence\":1,\"text\":\"- \"}.",
+    "Insert text into an existing Google Doc. For a newly created or blank doc, prefer position:'end' for the first write. " +
+      "Prefer position:'start'|'end' or before_text/after_text anchors instead of raw indices when possible, and use raw indices only after inspecting gdrive_get_document_info include_content=true. " +
+      "Examples: {\"document_id\":\"doc123\",\"position\":\"end\",\"text\":\"Hello\"} or {\"document_id\":\"doc123\",\"before_text\":\"TODO\",\"occurrence\":1,\"text\":\"- \"}.",
     {
       document_id: z.string().describe("Google Docs document ID"),
       tab_id: z.string().optional().describe("Optional tab ID; defaults to the first tab"),
@@ -1457,11 +1486,11 @@ export function createServer(
         .int()
         .min(0)
         .optional()
-        .describe("Power-user fallback: explicit UTF-16 insertion index"),
+        .describe("Power-user fallback: explicit UTF-16 insertion index inside an existing text paragraph"),
       position: z
         .enum(["start", "end"])
         .optional()
-        .describe("LLM-friendly insertion target without index arithmetic"),
+        .describe("LLM-friendly insertion target without index arithmetic; for a brand-new or blank doc, 'end' is the safest first write"),
       before_text: z
         .string()
         .optional()

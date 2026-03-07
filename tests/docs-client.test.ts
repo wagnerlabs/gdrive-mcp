@@ -35,50 +35,55 @@ describe("DocsClient.getDocument", () => {
   it("returns normalized metadata and content with tab-aware reads", async () => {
     const mockDocs = makeMockDocs();
     const mockDrive = makeMockDrive();
-    mockDocs.documents.get.mockResolvedValue({
-      data: {
-        documentId: "doc1",
-        title: "Project Brief",
-        revisionId: "rev-1",
-        tabs: [
-          {
-            tabProperties: { tabId: "tab-1", title: "Main", index: 0, nestingLevel: 0 },
-            documentTab: {
-              body: {
-                content: [
-                  {
-                    startIndex: 1,
-                    endIndex: 7,
-                    paragraph: {
-                      elements: [
-                        {
-                          startIndex: 1,
-                          endIndex: 7,
-                          textRun: {
-                            content: "Hello\n",
-                            textStyle: { bold: true },
+    mockDocs.documents.get
+      .mockResolvedValueOnce({
+        data: {
+          documentId: "doc1",
+          title: "Project Brief",
+          tabs: [
+            {
+              tabProperties: { tabId: "tab-1", title: "Main", index: 0, nestingLevel: 0 },
+              documentTab: {
+                body: {
+                  content: [
+                    {
+                      startIndex: 1,
+                      endIndex: 7,
+                      paragraph: {
+                        elements: [
+                          {
+                            startIndex: 1,
+                            endIndex: 7,
+                            textRun: {
+                              content: "Hello\n",
+                              textStyle: { bold: true },
+                            },
                           },
+                        ],
+                        paragraphStyle: {
+                          namedStyleType: "HEADING_1",
+                          alignment: "CENTER",
                         },
-                      ],
-                      paragraphStyle: {
-                        namedStyleType: "HEADING_1",
-                        alignment: "CENTER",
                       },
                     },
-                  },
-                  {
-                    startIndex: 7,
-                    endIndex: 8,
-                    table: {},
-                  },
-                ],
+                    {
+                      startIndex: 7,
+                      endIndex: 8,
+                      table: {},
+                    },
+                  ],
+                },
+                lists: {},
               },
-              lists: {},
             },
-          },
-        ],
-      },
-    });
+          ],
+        },
+      })
+      .mockResolvedValueOnce({
+        data: {
+          revisionId: "rev-1",
+        },
+      });
     const client = makeClient(mockDocs, mockDrive);
 
     const result = await client.getDocument("doc1", {
@@ -95,6 +100,9 @@ describe("DocsClient.getDocument", () => {
         suggestionsViewMode: "SUGGESTIONS_INLINE",
       }),
     );
+    expect(mockDocs.documents.get.mock.calls[0][0].fields).toContain("documentTab(");
+    expect(mockDocs.documents.get.mock.calls[0][0].fields).toContain(",lists)");
+    expect(mockDocs.documents.get.mock.calls[0][0].fields).not.toContain("lists(listProperties");
     expect(result).toEqual(
       expect.objectContaining({
         documentId: "doc1",
@@ -127,14 +135,19 @@ describe("DocsClient.getDocument", () => {
   it("uses metadata-first field selection when content is omitted", async () => {
     const mockDocs = makeMockDocs();
     const mockDrive = makeMockDrive();
-    mockDocs.documents.get.mockResolvedValue({
-      data: {
-        documentId: "doc1",
-        title: "Doc",
-        revisionId: "rev-1",
-        tabs: [{ tabProperties: { tabId: "tab-1", title: "Main", index: 0, nestingLevel: 0 } }],
-      },
-    });
+    mockDocs.documents.get
+      .mockResolvedValueOnce({
+        data: {
+          documentId: "doc1",
+          title: "Doc",
+          tabs: [{ tabProperties: { tabId: "tab-1", title: "Main", index: 0, nestingLevel: 0 } }],
+        },
+      })
+      .mockResolvedValueOnce({
+        data: {
+          revisionId: "rev-1",
+        },
+      });
     const client = makeClient(mockDocs, mockDrive);
 
     await client.getDocument("doc1");
@@ -145,6 +158,13 @@ describe("DocsClient.getDocument", () => {
       }),
     );
     expect(mockDocs.documents.get.mock.calls[0][0].fields).not.toContain("textRun(content");
+    expect(mockDocs.documents.get.mock.calls[0][0].fields).not.toContain("revisionId");
+    expect(mockDocs.documents.get.mock.calls[1][0]).toEqual(
+      expect.objectContaining({
+        documentId: "doc1",
+        fields: "revisionId",
+      }),
+    );
   });
 });
 

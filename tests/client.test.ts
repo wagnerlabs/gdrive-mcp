@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { DriveClient, DriveAPIError, buildSearchQuery } from "../src/client.js";
+import { GaxiosError } from "gaxios";
+import { DriveClient, DriveAPIError, buildSearchQuery, handleApiError } from "../src/client.js";
 
 function makeMockDrive(overrides: Record<string, unknown> = {}) {
   return {
@@ -225,6 +226,36 @@ describe("DriveClient.readFile", () => {
 
     expect(result.mimeType).toBe("image/png");
     expect(result.content).toContain("Drawing exported as PNG");
+  });
+});
+
+describe("handleApiError", () => {
+  it("includes Google API details in generic 400 responses", () => {
+    const err = new GaxiosError(
+      "Request failed with status code 400",
+      { url: "https://docs.googleapis.com/v1/documents/doc1" },
+      {
+        config: { url: "https://docs.googleapis.com/v1/documents/doc1" },
+        data: {
+          error: {
+            message: "Request contains an invalid argument.",
+          },
+        },
+        status: 400,
+        statusText: "Bad Request",
+        headers: {},
+        request: { responseURL: "https://docs.googleapis.com/v1/documents/doc1" },
+      },
+    );
+
+    try {
+      handleApiError(err, "Google Docs");
+      throw new Error("Expected handleApiError to throw");
+    } catch (thrown) {
+      expect(thrown).toBeInstanceOf(DriveAPIError);
+      expect((thrown as Error).message).toContain("Bad request — check your query parameters.");
+      expect((thrown as Error).message).toContain("Google says: Request contains an invalid argument.");
+    }
   });
 });
 

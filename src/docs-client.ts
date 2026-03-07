@@ -212,7 +212,7 @@ function buildMetadataTabFields(depth: number): string {
 function buildContentTabFields(depth: number): string {
   const current = [
     "tabProperties",
-    "documentTab(body(content(startIndex,endIndex,paragraph(elements(startIndex,endIndex,textRun(content,textStyle),autoText(type,textStyle),pageBreak(textStyle),columnBreak(textStyle),footnoteReference,horizontalRule,equation,inlineObjectElement,person,richLink),paragraphStyle(namedStyleType,alignment),bullet(listId,nestingLevel,textStyle)),sectionBreak,table,tableOfContents)),lists(listProperties(nestingLevels(glyphType,glyphSymbol,glyphFormat))))",
+    "documentTab(body(content(startIndex,endIndex,paragraph(elements(startIndex,endIndex,textRun(content,textStyle),autoText(type,textStyle),pageBreak(textStyle),columnBreak(textStyle),footnoteReference,horizontalRule,equation,inlineObjectElement,person,richLink),paragraphStyle(namedStyleType,alignment),bullet(listId,nestingLevel,textStyle)),sectionBreak,table,tableOfContents)),lists)",
   ].join(",");
 
   if (depth <= 0) {
@@ -222,7 +222,7 @@ function buildContentTabFields(depth: number): string {
 }
 
 function buildDocumentFields(includeContent: boolean): string {
-  const base = "documentId,title,revisionId,suggestionsViewMode";
+  const base = "documentId,title";
   const tabs = includeContent
     ? buildContentTabFields(TAB_FIELD_DEPTH)
     : buildMetadataTabFields(TAB_FIELD_DEPTH);
@@ -251,6 +251,9 @@ export class DocsClient {
     const maxParagraphs = options.maxParagraphs ?? 200;
 
     try {
+      // The Docs API rejects tab-aware partial responses that also request
+      // revisionId, so fetch the tab tree first and fall back to a lightweight
+      // revision-only lookup.
       const res = await this.docs.documents.get({
         documentId,
         includeTabsContent: true,
@@ -298,11 +301,14 @@ export class DocsClient {
         })
         .filter(isNonNullable);
 
+      const resolvedDocumentId = res.data.documentId ?? documentId;
+      const revisionId = res.data.revisionId ?? (await this.getRevisionId(resolvedDocumentId));
+
       return {
-        documentId: res.data.documentId ?? documentId,
+        documentId: resolvedDocumentId,
         title: res.data.title ?? "Untitled document",
-        documentUrl: documentUrl(res.data.documentId ?? documentId),
-        revisionId: res.data.revisionId ?? undefined,
+        documentUrl: documentUrl(resolvedDocumentId),
+        revisionId,
         tabs,
         contentTruncated,
       };

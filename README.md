@@ -295,9 +295,14 @@ npm run build
 # Run tests
 npm test
 
+# Run the live Google Docs smoke test (requires saved credentials)
+npm run test:live
+
 # Run tests in watch mode
 npm run test:watch
 ```
+
+`npm run test:live` creates a temporary Google Doc, inserts text through the MCP server flow, verifies the content via `gdrive_get_document_info`, and then trashes the temporary file during cleanup.
 
 ## License
 

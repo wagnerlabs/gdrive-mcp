@@ -110,13 +110,46 @@ export function handleApiError(
 ): never {
   if (err instanceof GaxiosError) {
     const status = err.response?.status;
-    const message =
+    const detail = extractApiErrorDetail(err);
+    const baseMessage =
       status && ERROR_MESSAGES[status]
         ? ERROR_MESSAGES[status]
         : `${serviceLabel} API error: ${err.message}`;
+    const message =
+      detail && !baseMessage.includes(detail)
+        ? `${baseMessage} Google says: ${detail}`
+        : baseMessage;
     throw new DriveAPIError(message, status);
   }
   throw err;
+}
+
+function extractApiErrorDetail(err: GaxiosError): string | undefined {
+  const responseData = err.response?.data;
+  if (typeof responseData === "string" && responseData.trim().length > 0) {
+    return responseData.trim();
+  }
+  if (!responseData || typeof responseData !== "object") {
+    return undefined;
+  }
+
+  const data = responseData as {
+    error?: { message?: unknown; errors?: Array<{ message?: unknown }> };
+    error_description?: unknown;
+  };
+  if (typeof data.error?.message === "string" && data.error.message.trim().length > 0) {
+    return data.error.message.trim();
+  }
+  const nestedMessage = data.error?.errors?.find(
+    (entry) => typeof entry.message === "string" && entry.message.trim().length > 0,
+  )?.message;
+  if (typeof nestedMessage === "string") {
+    return nestedMessage.trim();
+  }
+  if (typeof data.error_description === "string" && data.error_description.trim().length > 0) {
+    return data.error_description.trim();
+  }
+  return undefined;
 }
 
 export class DriveClient {
