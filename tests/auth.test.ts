@@ -100,4 +100,29 @@ describe("runAuthFlow", () => {
     await expect(runAuthFlow()).rejects.toThrow(/No refresh token/);
     await expect(runAuthFlow()).rejects.toThrow(/myaccount.google.com/);
   });
+
+  it("requests both drive.readonly and spreadsheets scopes", async () => {
+    const { authenticate } = await import("@google-cloud/local-auth");
+    vi.mocked(authenticate).mockResolvedValue({
+      credentials: { access_token: "at", refresh_token: "rt" },
+    } as any);
+    vi.mocked(fs.access).mockResolvedValue(undefined);
+    vi.mocked(fs.readFile).mockResolvedValue(
+      '{"installed":{"client_id":"id","client_secret":"s"}}',
+    );
+    vi.mocked(fs.mkdir).mockResolvedValue(undefined as any);
+    vi.mocked(fs.writeFile).mockResolvedValue(undefined);
+
+    const { runAuthFlow } = await import("../src/auth.js");
+    await runAuthFlow();
+
+    expect(authenticate).toHaveBeenCalledWith(
+      expect.objectContaining({
+        scopes: [
+          "https://www.googleapis.com/auth/drive.readonly",
+          "https://www.googleapis.com/auth/spreadsheets",
+        ],
+      }),
+    );
+  });
 });

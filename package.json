@@ -1,7 +1,7 @@
 {
   "name": "gdrive-mcp",
   "version": "0.1.0",
-  "description": "A read-only MCP server for Google Drive — search, list, and read files via any MCP client",
+  "description": "An MCP server for Google Drive and Google Sheets — search, list, read, create, and edit spreadsheets via any MCP client",
   "type": "module",
   "main": "dist/index.js",
   "bin": {

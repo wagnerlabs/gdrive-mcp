@@ -104,13 +104,16 @@ export function buildSearchQuery(userQuery: string): string {
   return `${wrapped} and trashed = false`;
 }
 
-function handleApiError(err: unknown): never {
+export function handleApiError(
+  err: unknown,
+  serviceLabel: string = "Google Drive",
+): never {
   if (err instanceof GaxiosError) {
     const status = err.response?.status;
     const message =
       status && ERROR_MESSAGES[status]
         ? ERROR_MESSAGES[status]
-        : `Google Drive API error: ${err.message}`;
+        : `${serviceLabel} API error: ${err.message}`;
     throw new DriveAPIError(message, status);
   }
   throw err;

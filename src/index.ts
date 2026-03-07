@@ -3,6 +3,7 @@
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { runAuthFlow, loadCredentials } from "./auth.js";
 import { DriveClient } from "./client.js";
+import { SheetsClient } from "./sheets-client.js";
 import { createServer } from "./server.js";
 
 async function main(): Promise<void> {
@@ -27,8 +28,9 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
-  const client = new DriveClient(auth);
-  const server = createServer(client);
+  const driveClient = new DriveClient(auth);
+  const sheetsClient = new SheetsClient(auth);
+  const server = createServer(driveClient, sheetsClient);
   const transport = new StdioServerTransport();
   await server.connect(transport);
 }
