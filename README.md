@@ -2,7 +2,7 @@
 
 A [Model Context Protocol](https://modelcontextprotocol.io/) server that gives LLM-powered tools (Claude Code CLI, Cursor, Claude Desktop, etc.) access to Google Drive, Google Docs, and Google Sheets.
 
-Search, list, and read files, including automatic export of Google Docs as Markdown, Sheets as CSV, and Slides as plain text. Create and edit Google Docs with targeted text insertion, replacement, formatting, headings, lists, alignment, rename, and duplicate operations. Create and edit Google Sheets with value updates, formatting, tab management, and row or column operations. Works with both personal drives and shared drives.
+Search, list, and read files, including automatic export of Google Docs as Markdown, Sheets as CSV, and Slides as plain text. Create and edit Google Docs with revision-protected text, rich content, native lists, and native tables. Create and edit Google Sheets with bounded range reads, value preconditions, formatting, tab management, and row or column operations. Works with both personal drives and shared drives.
 
 ## Quick start
 
@@ -77,7 +77,9 @@ Add to `claude_desktop_config.json`:
 | `gdrive_read_file` | Read file content (Docs → Markdown, Sheets → CSV, Slides → plain text) |
 | `gdrive_list_files` | List files in a folder with sorting and pagination |
 | `gdrive_get_spreadsheet_info` | Get spreadsheet metadata including all sheet tabs and named ranges |
+| `gdrive_get_sheet_values` | Read a bounded A1 range (up to 10,000 cells) for inspection or a later value precondition |
 | `gdrive_get_document_info` | Get Google Docs metadata and optional tab-scoped structured content |
+| `gdrive_get_document_content` | Read a Docs tab as paginated, revision-bound paragraphs and native table blocks |
 
 ### Write tools
 
@@ -101,13 +103,19 @@ Add to `claude_desktop_config.json`:
 | Tool | Description | Destructive | Idempotent |
 |------|-------------|:-----------:|:----------:|
 | `gdrive_create_doc` | Create a blank Google Doc, optionally in a specific folder | No | No |
+| `gdrive_insert_doc_content` | Insert styled paragraph blocks and nested native lists in one revision-controlled batch | No | No |
+| `gdrive_batch_update_doc` | Apply up to 100 non-overlapping anchor-based text, style, paragraph, or list changes atomically | Yes | No |
 | `gdrive_insert_doc_text` | Insert text at a position, explicit index, or text anchor | No | No |
 | `gdrive_replace_doc_text` | Replace a targeted text range or anchored text match | Yes | No |
 | `gdrive_replace_all_doc_text` | Replace every exact text match in a tab or across all tabs | Yes | Yes |
 | `gdrive_delete_doc_text` | Delete a targeted text range or anchored text match | Yes | No |
 | `gdrive_update_doc_text_style` | Apply character-level formatting such as bold, colors, fonts, and links | No | Yes |
-| `gdrive_update_doc_paragraph_style` | Apply headings and alignment to whole paragraphs | No | Yes |
-| `gdrive_update_doc_list` | Create, change, or remove list formatting on paragraphs | Yes | Yes |
+| `gdrive_update_doc_paragraph_style` | Apply headings, alignment, indentation, and paragraph spacing | No | Yes |
+| `gdrive_update_doc_list` | Create, continue, nest, change, or remove native list formatting | Yes | Yes |
+| `gdrive_insert_doc_table` | Insert a native table and optionally populate its cells | No | No |
+| `gdrive_update_doc_table_cells` | Replace multiple table cells with optional expected-text checks | Yes | No |
+| `gdrive_modify_doc_table` | Insert/delete rows or columns, merge/unmerge cells, or delete a table | Yes | No |
+| `gdrive_format_doc_table` | Format table cells, borders, columns, and rows | No | Yes |
 | `gdrive_rename_doc` | Rename an existing Google Doc file | Yes | No |
 | `gdrive_duplicate_doc` | Duplicate a Google Doc, optionally into a specific folder | No | No |
 
@@ -131,9 +139,11 @@ When reading files with `gdrive_read_file`, Google Workspace documents are autom
 | Text files (`.txt`, `.json`, `.js`, etc.) | Read directly as UTF-8 |
 | Binary files (images, PDFs, etc.) | Returns metadata with browser link |
 
-For full spreadsheet access (all tabs, structured data, editing), use `gdrive_get_spreadsheet_info` and the Sheets write tools instead of `gdrive_read_file`.
+For full spreadsheet access, use `gdrive_get_spreadsheet_info` to discover tabs and `gdrive_get_sheet_values` to read an exact bounded range. The returned rectangular `values` array can be passed directly as `expected_current_values` to `gdrive_update_sheet`.
 
-For structured Google Docs reads, paragraph-aware formatting, headings, lists, alignment, and anchor-based edits, use `gdrive_get_document_info` plus the Docs write tools. Structured paragraph responses include both raw `text` and `displayText` without the trailing paragraph newline, which is usually the safer anchor to round-trip back into Docs write tools. `gdrive_read_file` still remains the fastest way to read a Doc as Markdown.
+For structured Google Docs reads, use `gdrive_get_document_info` for compact metadata and tab discovery, then `gdrive_get_document_content` for bounded pages of paragraphs and native tables. Page tokens contain the document revision and fail with `STALE_PAGE_TOKEN` if a collaborator changes the document between pages. Structured paragraph responses include both raw `text` and `displayText` without the trailing paragraph newline, which is usually the safer anchor to round-trip into Docs write tools. `gdrive_read_file` remains the fastest way to read a Doc as Markdown.
+
+Table blocks expose a one-based `tablePath` such as `[2]`; nested tables extend that path, such as `[2,1]`. Table cell coordinates are zero-based. Covered coordinates inside merged cells are rejected instead of being silently redirected to another cell.
 
 ## Safety model
 
@@ -151,32 +161,38 @@ A spreadsheet is marked as "read" when the agent uses:
 
 - `gdrive_read_file` (shows cell data as CSV)
 - `gdrive_get_spreadsheet_info` (shows sheet structure and tabs)
+- `gdrive_get_sheet_values` (shows the exact requested cell range)
 - `gdrive_create_sheet` (the agent just created it, so it knows what's there)
 
 A Google Doc is marked as "read" when the agent uses:
 
 - `gdrive_read_file` (reads the Doc as Markdown and caches the current Docs revision when available)
 - `gdrive_get_document_info` (reads tab metadata or structured paragraph content)
+- `gdrive_get_document_content` (reads a revision-bound page of structured blocks)
 - `gdrive_create_doc` (the agent just created it)
 
 Every write tool checks this session state before executing. If the agent hasn't read the target resource, the call is rejected:
 
-> *"You must read this spreadsheet before writing to it. Use gdrive_read_file or gdrive_get_spreadsheet_info first."*
+> *"You must read this spreadsheet before writing to it. Use gdrive_read_file, gdrive_get_spreadsheet_info, or gdrive_get_sheet_values first."*
 
-> *"You must read this document before writing to it. Use gdrive_read_file or gdrive_get_document_info first."*
+> *"You must read this document before writing to it. Use gdrive_read_file, gdrive_get_document_info, or gdrive_get_document_content first."*
 
-This prevents the agent from accidentally targeting the wrong file. The set resets when the server process restarts (every MCP session).
+This is intentionally retained: it prevents blind writes and helps catch the wrong target. It is an authorization/awareness guard, not a concurrency guarantee. Preventing stale overwrites requires a revision/version check at write time, like the spreadsheet `expected_current_values` protection described below.
+
+The read set resets when the server process restarts (every MCP session).
 
 `gdrive_get_file` is deliberately excluded because it only returns Drive metadata, not sheet structure or document content.
 
 ### 3. Docs revision-aware writes
 
-Docs edits are tied to the revision the agent most recently read:
+Docs edits are tied to the revision the agent most recently read explicitly:
 
-- `conflict_mode: "strict"` is the default and uses Docs `requiredRevisionId`, so the edit fails if the document changed since it was read
+- `conflict_mode: "strict"` is the default. The server checks the current revision immediately before the edit and also sends Docs `requiredRevisionId`, closing the race between that check and the write. A mismatch fails as `STALE_DOCUMENT` and requires a reread.
 - `conflict_mode: "merge"` uses Docs `targetRevisionId`, which lets Google merge the edit with collaborator changes when possible
 
-The server also maintains a small session-scoped structured-content cache from `gdrive_get_document_info include_content=true`. Anchor-based tools such as `gdrive_insert_doc_text`, `gdrive_replace_doc_text`, `gdrive_update_doc_paragraph_style`, and `gdrive_update_doc_list` reuse that cache when the document revision still matches; otherwise the server fetches a fresh structured snapshot before resolving anchors.
+Internal metadata or anchor-resolution fetches do not silently advance the explicitly observed revision. This matters when a user edits a document after the agent reads it: an internal refresh may help resolve an anchor, but strict mode still refuses to write against the newer unseen revision.
+
+The server also maintains a small session-scoped structured-content cache. Anchor-based tools reuse it when the document revision still matches; otherwise the server fetches a fresh structured snapshot before resolving anchors. Prefer text anchors, table paths, and cell coordinates over raw Docs indices. Explicit indices remain available as an advanced fallback and are validated against editable paragraph ranges where possible.
 
 For targeted Docs text edits, you can also pass `expected_text` as an optimistic safety check. This verifies the exact text in the resolved range before the write is sent.
 
@@ -184,7 +200,7 @@ For anchor-based `gdrive_delete_doc_text` and `gdrive_replace_doc_text`, the ser
 
 ### 4. Sheets precondition check
 
-`gdrive_update_sheet` accepts an optional `expected_current_values` parameter — a 2D array the same shape as `values`. When provided, the server reads the current cell contents and compares them before writing. If they don't match, the write is refused with an error showing what the cells actually contain.
+`gdrive_update_sheet` accepts an optional `expected_current_values` parameter — a 2D array the same shape as `values`. When provided, the server reads the current cell contents and compares them before writing. If they don't match, the write is refused with `STALE_SHEET_VALUES`, the range, and the actual values. Read the range again with `gdrive_get_sheet_values` before retrying.
 
 - **For small, targeted edits** (changing one cell, fixing a formula): include `expected_current_values` as a safety net.
 - **For bulk operations** (reformatting dates across 1,000 rows): skip it to avoid doubling API calls and hitting rate limits.
@@ -225,8 +241,10 @@ If no setup changes are needed, `./scripts/upgrade.sh` just rebuilds and confirm
 - Spreadsheet creation (`gdrive_create_sheet`) places the new spreadsheet in the user's root Drive folder. Creating in a specific folder is not supported.
 - `gdrive_read_file` exports spreadsheets as CSV from the first sheet only. Use `gdrive_get_spreadsheet_info` to discover all tabs.
 - `gdrive_read_file` continues to export Google Docs as Markdown. Use `gdrive_get_document_info` when you need tab metadata, paragraph boundaries, headings, list state, or anchor-friendly ranges.
-- For Docs formatting and paragraph structure changes, prefer reading with `gdrive_get_document_info include_content=true` first so the agent has exact paragraph boundaries and revision-aware anchor data.
+- For Docs formatting and paragraph structure changes, prefer `gdrive_get_document_content` so the agent has complete, paginated, revision-aware block and table data.
 - `gdrive_replace_all_doc_text` defaults to the first tab for safety. To replace across every tab, you must set `all_tabs: true` explicitly.
+- Numbered lists use native Google Docs list state. The server will continue a compatible preceding list when requested or fail clearly; it does not simulate numbering by inserting literal digits.
+- Live visual inspection and screenshot-based post-write verification are deliberately deferred to a later release. This server verifies structure and revisions through the Docs API, but it does not claim pixel-level layout fidelity.
 
 ## Development
 
@@ -250,7 +268,7 @@ npm run test:live
 npm run test:watch
 ```
 
-`npm run test:live` creates a temporary Google Doc, inserts text through the MCP server flow, verifies the content via `gdrive_get_document_info`, and then trashes the temporary file during cleanup.
+`npm run test:live` creates a temporary Google Doc, exercises revision-controlled text and structured reads through the MCP server flow, verifies the result, and then trashes the temporary file during cleanup. Set `RUN_LIVE_GOOGLE_TESTS=1` if invoking Vitest directly.
 
 ## License
 

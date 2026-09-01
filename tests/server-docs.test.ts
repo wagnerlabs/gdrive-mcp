@@ -43,6 +43,7 @@ function makeMockDocsClient(): DocsClient {
     updateTextStyle: vi.fn(),
     updateParagraphStyle: vi.fn(),
     updateList: vi.fn(),
+    batchUpdateRequests: vi.fn(),
     renameDocument: vi.fn(),
     duplicateDocument: vi.fn(),
   } as unknown as DocsClient;
@@ -288,6 +289,83 @@ function makeThreeParagraphDocumentContent(
   };
 }
 
+function makeTableDocumentContent(
+  revisionId: string = "rev-1",
+): NormalizedDocument {
+  const paragraph = {
+    type: "paragraph" as const,
+    startIndex: 3,
+    endIndex: 6,
+    displayText: "A",
+    text: "A\n",
+    list: null,
+    elements: [{
+      type: "textRun" as const,
+      startIndex: 3,
+      endIndex: 5,
+      text: "A\n",
+      textStyle: null,
+    }],
+  };
+  const table = {
+    type: "table" as const,
+    startIndex: 1,
+    endIndex: 14,
+    tablePath: [1],
+    rows: 1,
+    columns: 2,
+    columnWidths: [100, 100],
+    tableRows: [{
+      rowIndex: 0,
+      startIndex: 2,
+      endIndex: 14,
+      cells: [
+        {
+          rowIndex: 0,
+          columnIndex: 0,
+          startIndex: 2,
+          endIndex: 7,
+          text: "A\n",
+          style: { rowSpan: 1, columnSpan: 1 },
+          blocks: [paragraph],
+        },
+        {
+          rowIndex: 0,
+          columnIndex: 1,
+          startIndex: 7,
+          endIndex: 13,
+          text: "B\n",
+          style: { rowSpan: 1, columnSpan: 1 },
+          blocks: [{ ...paragraph, startIndex: 8, endIndex: 11, text: "B\n", displayText: "B" }],
+        },
+      ],
+    }],
+  };
+  return {
+    documentId: "doc1",
+    title: "Doc",
+    documentUrl: "https://docs.google.com/document/d/doc1/edit",
+    revisionId,
+    contentTruncated: false,
+    tabs: [{
+      tabId: "tab-1",
+      title: "Main",
+      index: 0,
+      nestingLevel: 0,
+      blocks: [table],
+      paragraphs: [{
+        type: "paragraph",
+        startIndex: 1,
+        endIndex: 14,
+        displayText: "",
+        text: "",
+        list: null,
+        elements: [{ type: "placeholder", startIndex: 1, endIndex: 14, placeholderKind: "table" }],
+      }],
+    }],
+  };
+}
+
 describe("Docs server behavior", () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -298,6 +376,48 @@ describe("Docs server behavior", () => {
     const tools = getTools(server);
     const argsByTool: Record<string, Record<string, unknown>> = {
       gdrive_insert_doc_text: { document_id: "doc1", text: "Hello", position: "end", match_case: true, conflict_mode: "strict" },
+      gdrive_insert_doc_content: {
+        document_id: "doc1",
+        blocks: [{ segments: [{ text: "Hello" }] }],
+        position: "end",
+        match_case: true,
+        inherit_neighbor_style: false,
+        conflict_mode: "strict",
+      },
+      gdrive_batch_update_doc: {
+        document_id: "doc1",
+        operations: [{ type: "delete", target_text: "Hello", match_case: true }],
+        conflict_mode: "strict",
+      },
+      gdrive_insert_doc_table: {
+        document_id: "doc1",
+        rows: 2,
+        columns: 2,
+        position: "end",
+        match_case: true,
+        conflict_mode: "strict",
+      },
+      gdrive_update_doc_table_cells: {
+        document_id: "doc1",
+        tab_id: "tab-1",
+        table_path: [1],
+        updates: [{ row_index: 0, column_index: 0, text: "X" }],
+        conflict_mode: "strict",
+      },
+      gdrive_modify_doc_table: {
+        document_id: "doc1",
+        tab_id: "tab-1",
+        table_path: [1],
+        operations: [{ type: "delete_row", row_index: 0 }],
+        conflict_mode: "strict",
+      },
+      gdrive_format_doc_table: {
+        document_id: "doc1",
+        tab_id: "tab-1",
+        table_path: [1],
+        background_color: "#FFFFFF",
+        conflict_mode: "strict",
+      },
       gdrive_replace_doc_text: {
         document_id: "doc1",
         replacement_text: "Updated",
@@ -379,6 +499,39 @@ describe("Docs server behavior", () => {
     expect(docs.renameDocument).toHaveBeenCalledWith("doc1", "Renamed");
     expect(docs.getDocument).not.toHaveBeenCalled();
     expect(docs.getRevisionId).not.toHaveBeenCalled();
+  });
+
+  it("rejects a strict write when the user changed the document after the explicit read", async () => {
+    const { server, docs } = makeServer();
+    const tools = getTools(server);
+
+    (docs.getDocument as ReturnType<typeof vi.fn>).mockResolvedValueOnce(
+      makeDocumentMetadata("rev-1"),
+    );
+    await tools["gdrive_get_document_info"].handler(
+      { document_id: "doc1", include_content: false, max_chars: 20_000, max_paragraphs: 200 },
+      {},
+    );
+
+    (docs.getDocument as ReturnType<typeof vi.fn>).mockResolvedValue(
+      makeDocumentMetadata("rev-2"),
+    );
+    (docs.getRevisionId as ReturnType<typeof vi.fn>).mockResolvedValue("rev-2");
+
+    const result = await tools["gdrive_insert_doc_text"].handler(
+      {
+        document_id: "doc1",
+        text: "Agent edit",
+        position: "end",
+        match_case: true,
+        conflict_mode: "strict",
+      },
+      {},
+    );
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("STALE_DOCUMENT");
+    expect(docs.insertText).not.toHaveBeenCalled();
   });
 
   it("unlocks document writes after gdrive_read_file and caches the revision", async () => {
@@ -1254,5 +1407,378 @@ describe("Docs server behavior", () => {
 
     expect(renameResult.isError).toBeUndefined();
     expect(docs.renameDocument).toHaveBeenCalledWith("copy-1", "Copy Renamed");
+  });
+
+  it("returns native table blocks through the bounded content reader", async () => {
+    const { server, docs } = makeServer();
+    const tools = getTools(server);
+    (docs.getDocument as ReturnType<typeof vi.fn>).mockResolvedValue(
+      makeTableDocumentContent("rev-1"),
+    );
+
+    const result = await tools["gdrive_get_document_content"].handler(
+      { document_id: "doc1", tab_id: "tab-1", max_blocks: 50 },
+      {},
+    );
+    const data = parseToolResult<any>(result);
+
+    expect(data.revisionId).toBe("rev-1");
+    expect(data.tab.blocks[0]).toEqual(
+      expect.objectContaining({ type: "table", tablePath: [1], rows: 1, columns: 2 }),
+    );
+  });
+
+  it("binds document content page tokens to the revision", async () => {
+    const { server, docs } = makeServer();
+    const tools = getTools(server);
+    const firstRevision = makeTableDocumentContent("rev-1");
+    firstRevision.tabs[0].blocks!.push({
+      type: "paragraph",
+      startIndex: 14,
+      endIndex: 19,
+      displayText: "tail",
+      text: "tail\n",
+      list: null,
+      elements: [{
+        type: "textRun",
+        startIndex: 14,
+        endIndex: 19,
+        text: "tail\n",
+        textStyle: null,
+      }],
+    });
+    const secondRevision = structuredClone(firstRevision);
+    secondRevision.revisionId = "rev-2";
+    (docs.getDocument as ReturnType<typeof vi.fn>)
+      .mockResolvedValueOnce(firstRevision)
+      .mockResolvedValueOnce(secondRevision);
+
+    const first = await tools["gdrive_get_document_content"].handler(
+      { document_id: "doc1", tab_id: "tab-1", max_blocks: 1 },
+      {},
+    );
+    const firstData = parseToolResult<{ nextPageToken: string }>(first);
+    const second = await tools["gdrive_get_document_content"].handler(
+      {
+        document_id: "doc1",
+        tab_id: "tab-1",
+        page_token: firstData.nextPageToken,
+        max_blocks: 1,
+      },
+      {},
+    );
+
+    expect(second.isError).toBe(true);
+    expect(second.content[0].text).toContain("STALE_PAGE_TOKEN");
+  });
+
+  it("fragments an oversized table cell into bounded content pages", async () => {
+    const { server, docs } = makeServer();
+    const tools = getTools(server);
+    const document = makeTableDocumentContent("rev-1");
+    const table = document.tabs[0].blocks![0];
+    if (table.type !== "table") throw new Error("test fixture must contain a table");
+    const cell = table.tableRows[0].cells[0];
+    cell.text = `${"x".repeat(30_000)}\n`;
+    cell.blocks = [{
+      type: "paragraph",
+      startIndex: 3,
+      endIndex: 30_004,
+      displayText: "x".repeat(30_000),
+      text: cell.text,
+      list: null,
+      elements: [{
+        type: "textRun",
+        startIndex: 3,
+        endIndex: 30_004,
+        text: cell.text,
+        textStyle: null,
+      }],
+    }];
+    (docs.getDocument as ReturnType<typeof vi.fn>).mockResolvedValue(document);
+
+    const result = await tools["gdrive_get_document_content"].handler(
+      { document_id: "doc1", tab_id: "tab-1", max_blocks: 1 },
+      {},
+    );
+    const data = parseToolResult<any>(result);
+    const fragment = data.tab.blocks[0];
+
+    expect(result.isError).toBeUndefined();
+    expect(Buffer.byteLength(result.content[0].text, "utf8")).toBeLessThan(48_000);
+    expect(fragment.fragment).toEqual({ rowIndex: 0, columnIndex: 0 });
+    expect(fragment.tableRows[0].cells[0].fragment).toEqual({
+      textOffset: 0,
+      totalTextLength: 30_001,
+    });
+    expect(data.nextPageToken).toEqual(expect.any(String));
+  });
+
+  it("inserts rich content and formatting as one revision-controlled batch", async () => {
+    const { server, docs } = makeServer();
+    const tools = getTools(server);
+    (docs.getDocument as ReturnType<typeof vi.fn>).mockResolvedValue(
+      makeBlankDocumentContent("doc1", "rev-1"),
+    );
+    (docs.getRevisionId as ReturnType<typeof vi.fn>).mockResolvedValue("rev-1");
+    (docs.batchUpdateRequests as ReturnType<typeof vi.fn>).mockResolvedValue({
+      documentId: "doc1",
+      revisionId: "rev-2",
+    });
+    await tools["gdrive_get_document_info"].handler(
+      { document_id: "doc1", include_content: true, tab_id: "tab-1", max_chars: 20_000, max_paragraphs: 200 },
+      {},
+    );
+
+    const result = await tools["gdrive_insert_doc_content"].handler(
+      {
+        document_id: "doc1",
+        tab_id: "tab-1",
+        position: "end",
+        blocks: [{
+          segments: [{ text: "Heading", bold: true }],
+          named_style_type: "HEADING_2",
+          space_below_points: 6,
+        }],
+        match_case: true,
+        inherit_neighbor_style: false,
+        conflict_mode: "strict",
+      },
+      {},
+    );
+
+    expect(result.isError).toBeUndefined();
+    const [documentId, requests, revisionId, conflictMode, sortByIndex] =
+      (docs.batchUpdateRequests as ReturnType<typeof vi.fn>).mock.calls[0];
+    expect({ documentId, revisionId, conflictMode, sortByIndex }).toEqual({
+      documentId: "doc1",
+      revisionId: "rev-1",
+      conflictMode: "strict",
+      sortByIndex: false,
+    });
+    expect(requests[0]).toHaveProperty("insertText");
+    expect(requests).toEqual(expect.arrayContaining([
+      expect.objectContaining({ updateTextStyle: expect.any(Object) }),
+      expect.objectContaining({ updateParagraphStyle: expect.any(Object) }),
+    ]));
+  });
+
+  it("resolves multi-operation document batches against one snapshot", async () => {
+    const { server, docs } = makeServer();
+    const tools = getTools(server);
+    (docs.getDocument as ReturnType<typeof vi.fn>).mockResolvedValue(
+      makeDocumentContent("rev-1"),
+    );
+    (docs.getRevisionId as ReturnType<typeof vi.fn>).mockResolvedValue("rev-1");
+    (docs.batchUpdateRequests as ReturnType<typeof vi.fn>).mockResolvedValue({
+      documentId: "doc1",
+      revisionId: "rev-2",
+    });
+    await tools["gdrive_get_document_info"].handler(
+      { document_id: "doc1", include_content: true, tab_id: "tab-1", max_chars: 20_000, max_paragraphs: 200 },
+      {},
+    );
+
+    const result = await tools["gdrive_batch_update_doc"].handler(
+      {
+        document_id: "doc1",
+        tab_id: "tab-1",
+        operations: [
+          { type: "replace", target_text: "Hello", occurrence: 1, match_case: true, replacement_text: "Hi" },
+          { type: "text_style", target_text: "Hello", occurrence: 2, match_case: true, bold: true },
+        ],
+        conflict_mode: "strict",
+      },
+      {},
+    );
+
+    expect(result.isError).toBeUndefined();
+    expect(docs.batchUpdateRequests).toHaveBeenCalledTimes(1);
+    expect(docs.batchUpdateRequests).toHaveBeenCalledWith(
+      "doc1",
+      expect.arrayContaining([
+        expect.objectContaining({ deleteContentRange: expect.any(Object) }),
+        expect.objectContaining({ insertText: expect.any(Object) }),
+        expect.objectContaining({ updateTextStyle: expect.any(Object) }),
+      ]),
+      "rev-1",
+      "strict",
+      true,
+    );
+  });
+
+  it("replaces table cells with expected-text protection and descending requests", async () => {
+    const { server, docs } = makeServer();
+    const tools = getTools(server);
+    (docs.getDocument as ReturnType<typeof vi.fn>)
+      .mockResolvedValueOnce(makeTableDocumentContent("rev-1"));
+    await tools["gdrive_get_document_info"].handler(
+      { document_id: "doc1", include_content: true, tab_id: "tab-1", max_chars: 20_000, max_paragraphs: 200 },
+      {},
+    );
+
+    (docs.getDocument as ReturnType<typeof vi.fn>).mockResolvedValue(
+      makeTableDocumentContent("rev-2"),
+    );
+    (docs.getRevisionId as ReturnType<typeof vi.fn>).mockResolvedValue("rev-1");
+    (docs.batchUpdateRequests as ReturnType<typeof vi.fn>).mockResolvedValue({
+      documentId: "doc1",
+      revisionId: "rev-2",
+    });
+
+    const result = await tools["gdrive_update_doc_table_cells"].handler(
+      {
+        document_id: "doc1",
+        tab_id: "tab-1",
+        table_path: [1],
+        updates: [
+          { row_index: 0, column_index: 0, text: "Alpha", expected_text: "A" },
+          { row_index: 0, column_index: 1, text: "Beta", expected_text: "B" },
+        ],
+        conflict_mode: "strict",
+      },
+      {},
+    );
+
+    expect(result.isError).toBeUndefined();
+    expect(docs.batchUpdateRequests).toHaveBeenCalledWith(
+      "doc1",
+      expect.arrayContaining([
+        expect.objectContaining({ deleteContentRange: expect.any(Object) }),
+        expect.objectContaining({ insertText: expect.any(Object) }),
+      ]),
+      "rev-1",
+      "strict",
+      true,
+    );
+  });
+
+  it("builds ordered native table structure requests", async () => {
+    const { server, docs } = makeServer();
+    const tools = getTools(server);
+    (docs.getDocument as ReturnType<typeof vi.fn>).mockResolvedValue(
+      makeTableDocumentContent("rev-1"),
+    );
+    await tools["gdrive_get_document_info"].handler(
+      { document_id: "doc1", include_content: true, tab_id: "tab-1", max_chars: 20_000, max_paragraphs: 200 },
+      {},
+    );
+    (docs.getRevisionId as ReturnType<typeof vi.fn>).mockResolvedValue("rev-1");
+    (docs.batchUpdateRequests as ReturnType<typeof vi.fn>).mockResolvedValue({
+      documentId: "doc1",
+      revisionId: "rev-2",
+    });
+    (docs.getDocument as ReturnType<typeof vi.fn>).mockResolvedValue(
+      makeTableDocumentContent("rev-2"),
+    );
+
+    const result = await tools["gdrive_modify_doc_table"].handler(
+      {
+        document_id: "doc1",
+        tab_id: "tab-1",
+        table_path: [1],
+        operations: [
+          { type: "insert_row", row_index: 0, position: "after" },
+          { type: "merge", start_row: 0, start_column: 0, row_span: 1, column_span: 2 },
+        ],
+        conflict_mode: "strict",
+      },
+      {},
+    );
+
+    expect(result.isError).toBeUndefined();
+    const requests = (docs.batchUpdateRequests as ReturnType<typeof vi.fn>).mock.calls[0][1];
+    expect(requests[0]).toHaveProperty("insertTableRow");
+    expect(requests[1]).toHaveProperty("mergeTableCells");
+    expect(docs.batchUpdateRequests).toHaveBeenCalledWith(
+      "doc1",
+      requests,
+      "rev-1",
+      "strict",
+      false,
+    );
+  });
+
+  it("builds native table cell, border, column, and row formatting requests", async () => {
+    const { server, docs } = makeServer();
+    const tools = getTools(server);
+    (docs.getDocument as ReturnType<typeof vi.fn>).mockResolvedValue(
+      makeTableDocumentContent("rev-1"),
+    );
+    await tools["gdrive_get_document_info"].handler(
+      { document_id: "doc1", include_content: true, tab_id: "tab-1", max_chars: 20_000, max_paragraphs: 200 },
+      {},
+    );
+    (docs.getRevisionId as ReturnType<typeof vi.fn>).mockResolvedValue("rev-1");
+    (docs.batchUpdateRequests as ReturnType<typeof vi.fn>).mockResolvedValue({
+      documentId: "doc1",
+      revisionId: "rev-2",
+    });
+    (docs.getDocument as ReturnType<typeof vi.fn>).mockResolvedValue(
+      makeTableDocumentContent("rev-2"),
+    );
+
+    const result = await tools["gdrive_format_doc_table"].handler(
+      {
+        document_id: "doc1",
+        tab_id: "tab-1",
+        table_path: [1],
+        cell_range: { start_row: 0, start_column: 0, row_span: 1, column_span: 2 },
+        background_color: "#EEEEEE",
+        border_color: "#333333",
+        border_width_points: 1,
+        border_dash_style: "SOLID",
+        column_widths: [{ column_index: 0, width_points: 120 }],
+        row_styles: [{ row_index: 0, min_height_points: 24, prevent_overflow: true }],
+        conflict_mode: "strict",
+      },
+      {},
+    );
+
+    expect(result.isError).toBeUndefined();
+    const requests = (docs.batchUpdateRequests as ReturnType<typeof vi.fn>).mock.calls[0][1];
+    expect(requests).toEqual([
+      expect.objectContaining({ updateTableCellStyle: expect.any(Object) }),
+      expect.objectContaining({ updateTableColumnProperties: expect.any(Object) }),
+      expect.objectContaining({ updateTableRowStyle: expect.any(Object) }),
+    ]);
+  });
+
+  it("rebuilds native list nesting in one ordered batch", async () => {
+    const { server, docs } = makeServer();
+    const tools = getTools(server);
+    (docs.getDocument as ReturnType<typeof vi.fn>).mockResolvedValue(
+      makeThreeParagraphDocumentContent("rev-1"),
+    );
+    await tools["gdrive_get_document_info"].handler(
+      { document_id: "doc1", include_content: true, tab_id: "tab-1", max_chars: 20_000, max_paragraphs: 200 },
+      {},
+    );
+    (docs.getRevisionId as ReturnType<typeof vi.fn>).mockResolvedValue("rev-1");
+    (docs.batchUpdateRequests as ReturnType<typeof vi.fn>).mockResolvedValue({
+      documentId: "doc1",
+      revisionId: "rev-2",
+    });
+
+    const result = await tools["gdrive_update_doc_list"].handler(
+      {
+        document_id: "doc1",
+        tab_id: "tab-1",
+        target_text: "line one\nline two",
+        match_case: true,
+        preset: "NUMBERED",
+        nesting_levels: [0, 1],
+        continue_previous: false,
+        conflict_mode: "strict",
+      },
+      {},
+    );
+
+    expect(result.isError).toBeUndefined();
+    const requests = (docs.batchUpdateRequests as ReturnType<typeof vi.fn>).mock.calls[0][1];
+    expect(requests[0]).toHaveProperty("deleteParagraphBullets");
+    expect(requests[1]).toHaveProperty("updateParagraphStyle");
+    expect(requests).toEqual(expect.arrayContaining([expect.objectContaining({ insertText: expect.any(Object) })]));
+    expect(requests[requests.length - 1]).toHaveProperty("createParagraphBullets");
   });
 });

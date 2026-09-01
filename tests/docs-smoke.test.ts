@@ -25,7 +25,7 @@ function parseJsonResult(result: {
 
 describeLive("live Docs smoke test", () => {
   it(
-    "creates a doc and inserts text at the start through the MCP server flow",
+    "exercises revision-safe rich content, native lists, and native tables",
     async () => {
       const auth = await loadCredentials();
       const drive = google.drive({ version: "v3", auth });
@@ -99,6 +99,79 @@ describeLive("live Docs smoke test", () => {
             paragraph.text.includes("hi"),
           ),
         ).toBe(true);
+
+        const tabId = documentInfo.tabs[0]?.tabId;
+        expect(tabId).toEqual(expect.any(String));
+
+        const rich = parseJsonResult(
+          await tools["gdrive_insert_doc_content"].handler(
+            {
+              document_id: documentId,
+              tab_id: tabId,
+              position: "end",
+              blocks: [
+                {
+                  segments: [{ text: "Live smoke heading", bold: true }],
+                  named_style_type: "HEADING_2",
+                  space_below_points: 6,
+                },
+                {
+                  segments: [{ text: "First item" }],
+                  list: { preset: "NUMBERED", nesting_level: 0 },
+                },
+                {
+                  segments: [{ text: "Nested item" }],
+                  list: { preset: "NUMBERED", nesting_level: 1 },
+                },
+              ],
+              match_case: true,
+              inherit_neighbor_style: false,
+              conflict_mode: "strict",
+            },
+            {},
+          ),
+        );
+        expect(rich).toEqual(expect.objectContaining({
+          documentId,
+          blocksInserted: 3,
+          revisionId: expect.any(String),
+        }));
+
+        const insertedTable = parseJsonResult(
+          await tools["gdrive_insert_doc_table"].handler(
+            {
+              document_id: documentId,
+              tab_id: tabId,
+              rows: 2,
+              columns: 2,
+              values: [["A", "B"], ["C", "D"]],
+              position: "end",
+              match_case: true,
+              conflict_mode: "strict",
+            },
+            {},
+          ),
+        );
+        expect(insertedTable.table).toEqual(expect.objectContaining({
+          type: "table",
+          rows: 2,
+          columns: 2,
+          tablePath: expect.any(Array),
+        }));
+
+        const structured = parseJsonResult(
+          await tools["gdrive_get_document_content"].handler(
+            {
+              document_id: documentId,
+              tab_id: tabId,
+              max_blocks: 50,
+            },
+            {},
+          ),
+        );
+        expect(structured.tab.blocks).toEqual(expect.arrayContaining([
+          expect.objectContaining({ type: "table", rows: 2, columns: 2 }),
+        ]));
       } finally {
         if (documentId) {
           await drive.files.update({
@@ -110,6 +183,6 @@ describeLive("live Docs smoke test", () => {
         }
       }
     },
-    60_000,
+    120_000,
   );
 });

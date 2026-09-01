@@ -51,6 +51,7 @@ export type NormalizedDocElement =
   | NormalizedDocPlaceholderElement;
 
 export interface NormalizedDocParagraph {
+  type: "paragraph";
   startIndex: number;
   endIndex: number;
   // `displayText` omits the trailing paragraph newline so agents can safely
@@ -61,6 +62,12 @@ export interface NormalizedDocParagraph {
   text: string;
   namedStyleType?: DocNamedStyleType;
   alignment?: DocParagraphAlignment;
+  indentStart?: number;
+  indentEnd?: number;
+  indentFirstLine?: number;
+  spaceAbove?: number;
+  spaceBelow?: number;
+  lineSpacing?: number;
   list: {
     preset: "BULLETED" | "NUMBERED" | "CHECKBOX";
     nestingLevel: number;
@@ -69,6 +76,77 @@ export interface NormalizedDocParagraph {
   elements: NormalizedDocElement[];
 }
 
+export interface NormalizedDocTableCellStyle {
+  backgroundColor?: string;
+  contentAlignment?: string;
+  paddingTop?: number;
+  paddingBottom?: number;
+  paddingLeft?: number;
+  paddingRight?: number;
+  borderTop?: NormalizedDocTableBorder;
+  borderBottom?: NormalizedDocTableBorder;
+  borderLeft?: NormalizedDocTableBorder;
+  borderRight?: NormalizedDocTableBorder;
+  rowSpan: number;
+  columnSpan: number;
+}
+
+export interface NormalizedDocTableBorder {
+  color?: string;
+  width?: number;
+  dashStyle?: string;
+}
+
+export interface NormalizedDocTableCell {
+  rowIndex: number;
+  columnIndex: number;
+  startIndex: number;
+  endIndex: number;
+  text: string;
+  style: NormalizedDocTableCellStyle;
+  blocks: NormalizedDocBlock[];
+  fragment?: {
+    textOffset: number;
+    totalTextLength: number;
+  };
+}
+
+export interface NormalizedDocTableRow {
+  rowIndex: number;
+  startIndex: number;
+  endIndex: number;
+  minRowHeight?: number;
+  preventOverflow?: boolean;
+  cells: NormalizedDocTableCell[];
+}
+
+export interface NormalizedDocTableBlock {
+  type: "table";
+  startIndex: number;
+  endIndex: number;
+  tablePath: number[];
+  rows: number;
+  columns: number;
+  columnWidths: Array<number | null>;
+  tableRows: NormalizedDocTableRow[];
+  fragment?: {
+    rowIndex: number;
+    columnIndex?: number;
+  };
+}
+
+export interface NormalizedDocOtherBlock {
+  type: "other";
+  startIndex: number;
+  endIndex: number;
+  kind: "sectionBreak" | "tableOfContents" | "other";
+}
+
+export type NormalizedDocBlock =
+  | NormalizedDocParagraph
+  | NormalizedDocTableBlock
+  | NormalizedDocOtherBlock;
+
 export interface NormalizedDocTab {
   tabId: string;
   title: string;
@@ -76,6 +154,7 @@ export interface NormalizedDocTab {
   index: number;
   nestingLevel: number;
   paragraphs?: NormalizedDocParagraph[];
+  blocks?: NormalizedDocBlock[];
 }
 
 export interface NormalizedDocument {
@@ -165,6 +244,12 @@ export interface ParagraphStyleUpdateOptions {
   endIndex: number;
   namedStyleType?: DocNamedStyleType;
   alignment?: DocParagraphAlignment;
+  indentStartPoints?: number | null;
+  indentEndPoints?: number | null;
+  indentFirstLinePoints?: number | null;
+  spaceAbovePoints?: number | null;
+  spaceBelowPoints?: number | null;
+  lineSpacing?: number | null;
   revisionId?: string;
   conflictMode?: DocsConflictMode;
 }
@@ -224,7 +309,7 @@ function buildContentTabFields(depth: number): string {
   // normalization stable across includeTabsContent responses.
   const current = [
     "tabProperties",
-    "documentTab(body(content(startIndex,endIndex,paragraph(elements(startIndex,endIndex,textRun(content,textStyle),autoText(type,textStyle),pageBreak(textStyle),columnBreak(textStyle),footnoteReference,horizontalRule,equation,inlineObjectElement,person,richLink),paragraphStyle(namedStyleType,alignment),bullet(listId,nestingLevel,textStyle)),sectionBreak,table,tableOfContents)),lists)",
+    "documentTab(body(content(startIndex,endIndex,paragraph(elements(startIndex,endIndex,textRun(content,textStyle),autoText(type,textStyle),pageBreak(textStyle),columnBreak(textStyle),footnoteReference,horizontalRule,equation,inlineObjectElement,person,richLink),paragraphStyle(namedStyleType,alignment,indentStart,indentEnd,indentFirstLine,spaceAbove,spaceBelow,lineSpacing),bullet(listId,nestingLevel,textStyle)),sectionBreak,table,tableOfContents)),lists)",
   ].join(",");
 
   if (depth <= 0) {
@@ -266,12 +351,37 @@ export class DocsClient {
       // The Docs API rejects tab-aware partial responses that also request
       // revisionId, so fetch the tab tree first and fall back to a lightweight
       // revision-only lookup.
-      const res = await this.docs.documents.get({
+      const revisionBefore = includeContent
+        ? await this.getRevisionId(documentId)
+        : undefined;
+      let res = await this.docs.documents.get({
         documentId,
         includeTabsContent: true,
         suggestionsViewMode: "SUGGESTIONS_INLINE",
         fields: buildDocumentFields(includeContent),
       });
+
+      let revisionAfter = await this.getRevisionId(res.data.documentId ?? documentId);
+      if (
+        includeContent &&
+        revisionBefore &&
+        revisionAfter &&
+        revisionBefore !== revisionAfter
+      ) {
+        const retryRevisionBefore = revisionAfter;
+        res = await this.docs.documents.get({
+          documentId,
+          includeTabsContent: true,
+          suggestionsViewMode: "SUGGESTIONS_INLINE",
+          fields: buildDocumentFields(includeContent),
+        });
+        revisionAfter = await this.getRevisionId(res.data.documentId ?? documentId);
+        if (revisionAfter && retryRevisionBefore !== revisionAfter) {
+          throw new DriveAPIError(
+            "The document changed while it was being read. Read it again before editing.",
+          );
+        }
+      }
 
       const flatTabs = this.flattenTabs(res.data.tabs ?? []);
       if (options.tabId && !flatTabs.some((tab) => tab.tabProperties?.tabId === options.tabId)) {
@@ -304,6 +414,7 @@ export class DocsClient {
               remainingParagraphs,
             );
             normalized.paragraphs = content.paragraphs;
+            normalized.blocks = content.blocks;
             remainingChars = content.remainingChars;
             remainingParagraphs = content.remainingParagraphs;
             contentTruncated = contentTruncated || content.contentTruncated;
@@ -314,7 +425,7 @@ export class DocsClient {
         .filter(isNonNullable);
 
       const resolvedDocumentId = res.data.documentId ?? documentId;
-      const revisionId = res.data.revisionId ?? (await this.getRevisionId(resolvedDocumentId));
+      const revisionId = res.data.revisionId ?? revisionAfter;
 
       return {
         documentId: resolvedDocumentId,
@@ -637,14 +748,17 @@ export class DocsClient {
     }
   }
 
-  private async batchUpdateDocument(
+  async batchUpdateRequests(
     documentId: string,
     requests: docs_v1.Schema$Request[],
     revisionId?: string,
     conflictMode: DocsConflictMode = "strict",
+    sortByIndex: boolean = true,
   ): Promise<DocsWriteResult> {
     try {
-      const sortedRequests = this.sortRequestsForBatchUpdate(requests);
+      const sortedRequests = sortByIndex
+        ? this.sortRequestsForBatchUpdate(requests)
+        : requests;
 
       const res = await this.docs.documents.batchUpdate({
         documentId,
@@ -669,8 +783,34 @@ export class DocsClient {
         replies: res.data.replies ?? undefined,
       };
     } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      if (
+        revisionId &&
+        conflictMode === "strict" &&
+        /revision|requiredRevisionId/i.test(message)
+      ) {
+        throw new DriveAPIError(
+          "STALE_DOCUMENT: Google rejected the write because the document changed after it was read. Read it again before retrying.",
+          400,
+        );
+      }
       handleApiError(err, "Google Docs");
     }
+  }
+
+  private async batchUpdateDocument(
+    documentId: string,
+    requests: docs_v1.Schema$Request[],
+    revisionId?: string,
+    conflictMode: DocsConflictMode = "strict",
+  ): Promise<DocsWriteResult> {
+    return this.batchUpdateRequests(
+      documentId,
+      requests,
+      revisionId,
+      conflictMode,
+      true,
+    );
   }
 
   private getRequestIndex(request: docs_v1.Schema$Request): number {
@@ -721,35 +861,49 @@ export class DocsClient {
     remainingParagraphs: number,
   ): {
     paragraphs: NormalizedDocParagraph[];
+    blocks: NormalizedDocBlock[];
     remainingChars: number;
     remainingParagraphs: number;
     contentTruncated: boolean;
   } {
     const paragraphs: NormalizedDocParagraph[] = [];
+    const blocks: NormalizedDocBlock[] = [];
     let contentTruncated = false;
     const listPresetMap = this.buildListPresetMap(documentTab?.lists ?? undefined);
 
+    let tableOrdinal = 0;
     for (const element of documentTab?.body?.content ?? []) {
       if (remainingParagraphs <= 0) {
         contentTruncated = true;
         break;
       }
 
-      const paragraph = this.normalizeStructuralElement(element, listPresetMap);
-      if (!paragraph) {
+      const block = this.normalizeBlock(
+        element,
+        listPresetMap,
+        element.table ? [++tableOrdinal] : [],
+      );
+      if (!block) {
         continue;
       }
 
-      if (paragraph.text.length > remainingChars && paragraphs.length > 0) {
+      const blockText = this.blockText(block);
+
+      if (blockText.length > remainingChars && blocks.length > 0) {
         contentTruncated = true;
         break;
       }
 
-      paragraphs.push(paragraph);
+      blocks.push(block);
+      if (block.type === "paragraph") {
+        paragraphs.push(block);
+      } else {
+        paragraphs.push(this.legacyPlaceholderParagraph(block));
+      }
       remainingParagraphs -= 1;
-      remainingChars = Math.max(0, remainingChars - paragraph.text.length);
+      remainingChars = Math.max(0, remainingChars - blockText.length);
 
-      if (remainingChars === 0 && paragraph.text.length > 0) {
+      if (remainingChars === 0 && blockText.length > 0) {
         contentTruncated = true;
         break;
       }
@@ -757,9 +911,141 @@ export class DocsClient {
 
     return {
       paragraphs,
+      blocks,
       remainingChars,
       remainingParagraphs,
       contentTruncated,
+    };
+  }
+
+  private normalizeBlock(
+    element: docs_v1.Schema$StructuralElement,
+    listPresetMap: Map<string, "BULLETED" | "NUMBERED" | "CHECKBOX">,
+    tablePath: number[],
+  ): NormalizedDocBlock | null {
+    const startIndex = element.startIndex ?? 0;
+    const endIndex = element.endIndex ?? startIndex;
+    if (element.paragraph) {
+      return this.normalizeParagraph(element.paragraph, startIndex, endIndex, listPresetMap);
+    }
+    if (element.table) {
+      return this.normalizeTable(element.table, startIndex, endIndex, listPresetMap, tablePath);
+    }
+    if (element.sectionBreak || element.tableOfContents) {
+      return {
+        type: "other",
+        startIndex,
+        endIndex,
+        kind: element.sectionBreak ? "sectionBreak" : "tableOfContents",
+      };
+    }
+    return null;
+  }
+
+  private normalizeTable(
+    table: docs_v1.Schema$Table,
+    startIndex: number,
+    endIndex: number,
+    listPresetMap: Map<string, "BULLETED" | "NUMBERED" | "CHECKBOX">,
+    tablePath: number[],
+  ): NormalizedDocTableBlock {
+    let nestedTableOrdinal = 0;
+    const tableRows = (table.tableRows ?? []).map((row, rowIndex) => {
+      let gridColumnIndex = 0;
+      const cells = (row.tableCells ?? []).map((cell) => {
+        const columnIndex = gridColumnIndex;
+        gridColumnIndex += cell.tableCellStyle?.columnSpan ?? 1;
+        const blocks = (cell.content ?? [])
+          .map((child) => {
+            const childPath = child.table
+              ? [...tablePath, ++nestedTableOrdinal]
+              : [];
+            return this.normalizeBlock(child, listPresetMap, childPath);
+          })
+          .filter(isNonNullable);
+        const style = cell.tableCellStyle;
+        const normalizeBorder = (
+          border: docs_v1.Schema$TableCellBorder | null | undefined,
+        ): NormalizedDocTableBorder | undefined => border
+          ? {
+              color: this.optionalColorToHex(border.color ?? undefined),
+              width: border.width?.magnitude ?? undefined,
+              dashStyle: border.dashStyle ?? undefined,
+            }
+          : undefined;
+        return {
+          rowIndex,
+          columnIndex,
+          startIndex: cell.startIndex ?? startIndex,
+          endIndex: cell.endIndex ?? cell.startIndex ?? startIndex,
+          text: blocks.map((block) => this.blockText(block)).join(""),
+          style: {
+            backgroundColor: this.optionalColorToHex(style?.backgroundColor ?? undefined),
+            contentAlignment: style?.contentAlignment ?? undefined,
+            paddingTop: style?.paddingTop?.magnitude ?? undefined,
+            paddingBottom: style?.paddingBottom?.magnitude ?? undefined,
+            paddingLeft: style?.paddingLeft?.magnitude ?? undefined,
+            paddingRight: style?.paddingRight?.magnitude ?? undefined,
+            borderTop: normalizeBorder(style?.borderTop),
+            borderBottom: normalizeBorder(style?.borderBottom),
+            borderLeft: normalizeBorder(style?.borderLeft),
+            borderRight: normalizeBorder(style?.borderRight),
+            rowSpan: style?.rowSpan ?? 1,
+            columnSpan: style?.columnSpan ?? 1,
+          },
+          blocks,
+        };
+      });
+      return {
+        rowIndex,
+        startIndex: row.startIndex ?? startIndex,
+        endIndex: row.endIndex ?? row.startIndex ?? startIndex,
+        minRowHeight: row.tableRowStyle?.minRowHeight?.magnitude ?? undefined,
+        preventOverflow: row.tableRowStyle?.preventOverflow ?? undefined,
+        cells,
+      };
+    });
+
+    return {
+      type: "table",
+      startIndex,
+      endIndex,
+      tablePath,
+      rows: table.rows ?? tableRows.length,
+      columns: table.columns ?? Math.max(0, ...tableRows.map((row) => row.cells.length)),
+      columnWidths: (table.tableStyle?.tableColumnProperties ?? []).map(
+        (column) => column.width?.magnitude ?? null,
+      ),
+      tableRows,
+    };
+  }
+
+  private blockText(block: NormalizedDocBlock): string {
+    if (block.type === "paragraph") {
+      return block.text;
+    }
+    if (block.type === "table") {
+      return block.tableRows
+        .map((row) => row.cells.map((cell) => cell.text).join("\t"))
+        .join("\n");
+    }
+    return "";
+  }
+
+  private legacyPlaceholderParagraph(block: Exclude<NormalizedDocBlock, NormalizedDocParagraph>): NormalizedDocParagraph {
+    return {
+      type: "paragraph",
+      startIndex: block.startIndex,
+      endIndex: block.endIndex,
+      displayText: "",
+      text: "",
+      list: null,
+      elements: [{
+        type: "placeholder",
+        startIndex: block.startIndex,
+        endIndex: block.endIndex,
+        placeholderKind: block.type === "table" ? "table" : "other",
+      }],
     };
   }
 
@@ -781,6 +1067,7 @@ export class DocsClient {
 
     if (element.table || element.tableOfContents || element.sectionBreak) {
       return {
+        type: "paragraph",
         startIndex,
         endIndex,
         displayText: "",
@@ -839,6 +1126,7 @@ export class DocsClient {
     const nestingLevel = paragraph.bullet?.nestingLevel ?? 0;
 
     return {
+      type: "paragraph",
       startIndex,
       endIndex,
       displayText: paragraphDisplayText(text),
@@ -849,6 +1137,12 @@ export class DocsClient {
       alignment: paragraph.paragraphStyle?.alignment as
         | DocParagraphAlignment
         | undefined,
+      indentStart: paragraph.paragraphStyle?.indentStart?.magnitude ?? undefined,
+      indentEnd: paragraph.paragraphStyle?.indentEnd?.magnitude ?? undefined,
+      indentFirstLine: paragraph.paragraphStyle?.indentFirstLine?.magnitude ?? undefined,
+      spaceAbove: paragraph.paragraphStyle?.spaceAbove?.magnitude ?? undefined,
+      spaceBelow: paragraph.paragraphStyle?.spaceBelow?.magnitude ?? undefined,
+      lineSpacing: paragraph.paragraphStyle?.lineSpacing ?? undefined,
       list: listId
         ? {
             preset: listPresetMap.get(listId) ?? "BULLETED",
@@ -1032,6 +1326,40 @@ export class DocsClient {
     if (options.alignment !== undefined) {
       paragraphStyle.alignment = options.alignment;
       fields.push("alignment");
+    }
+    const dimensions: Array<[
+      keyof Pick<ParagraphStyleUpdateOptions,
+        | "indentStartPoints"
+        | "indentEndPoints"
+        | "indentFirstLinePoints"
+        | "spaceAbovePoints"
+        | "spaceBelowPoints">,
+      keyof docs_v1.Schema$ParagraphStyle,
+      string,
+    ]> = [
+      ["indentStartPoints", "indentStart", "indentStart"],
+      ["indentEndPoints", "indentEnd", "indentEnd"],
+      ["indentFirstLinePoints", "indentFirstLine", "indentFirstLine"],
+      ["spaceAbovePoints", "spaceAbove", "spaceAbove"],
+      ["spaceBelowPoints", "spaceBelow", "spaceBelow"],
+    ];
+    for (const [optionKey, styleKey, field] of dimensions) {
+      const value = options[optionKey];
+      if (value !== undefined) {
+        fields.push(field);
+        if (value !== null) {
+          (paragraphStyle as Record<string, unknown>)[styleKey] = {
+            magnitude: value,
+            unit: "PT",
+          };
+        }
+      }
+    }
+    if (options.lineSpacing !== undefined) {
+      fields.push("lineSpacing");
+      if (options.lineSpacing !== null) {
+        paragraphStyle.lineSpacing = options.lineSpacing;
+      }
     }
 
     if (fields.length === 0) {

@@ -37,6 +37,9 @@ describe("DocsClient.getDocument", () => {
     const mockDrive = makeMockDrive();
     mockDocs.documents.get
       .mockResolvedValueOnce({
+        data: { revisionId: "rev-1" },
+      })
+      .mockResolvedValueOnce({
         data: {
           documentId: "doc1",
           title: "Project Brief",
@@ -63,13 +66,72 @@ describe("DocsClient.getDocument", () => {
                         paragraphStyle: {
                           namedStyleType: "HEADING_1",
                           alignment: "CENTER",
+                          indentStart: { magnitude: 18, unit: "PT" },
+                          spaceBelow: { magnitude: 6, unit: "PT" },
                         },
                       },
                     },
                     {
                       startIndex: 7,
-                      endIndex: 8,
-                      table: {},
+                      endIndex: 20,
+                      table: {
+                        rows: 1,
+                        columns: 2,
+                        tableStyle: {
+                          tableColumnProperties: [
+                            { width: { magnitude: 120, unit: "PT" }, widthType: "FIXED_WIDTH" },
+                            { width: { magnitude: 180, unit: "PT" }, widthType: "FIXED_WIDTH" },
+                          ],
+                        },
+                        tableRows: [
+                          {
+                            startIndex: 8,
+                            endIndex: 20,
+                            tableCells: [
+                              {
+                                startIndex: 8,
+                                endIndex: 14,
+                                tableCellStyle: {
+                                  rowSpan: 1,
+                                  columnSpan: 1,
+                                  borderTop: {
+                                    color: { color: { rgbColor: { red: 1, green: 0, blue: 0 } } },
+                                    width: { magnitude: 2, unit: "PT" },
+                                    dashStyle: "SOLID",
+                                  },
+                                },
+                                content: [{
+                                  startIndex: 9,
+                                  endIndex: 13,
+                                  paragraph: {
+                                    elements: [{
+                                      startIndex: 9,
+                                      endIndex: 11,
+                                      textRun: { content: "A\n" },
+                                    }],
+                                  },
+                                }],
+                              },
+                              {
+                                startIndex: 14,
+                                endIndex: 20,
+                                tableCellStyle: { rowSpan: 1, columnSpan: 1 },
+                                content: [{
+                                  startIndex: 15,
+                                  endIndex: 19,
+                                  paragraph: {
+                                    elements: [{
+                                      startIndex: 15,
+                                      endIndex: 17,
+                                      textRun: { content: "B\n" },
+                                    }],
+                                  },
+                                }],
+                              },
+                            ],
+                          },
+                        ],
+                      },
                     },
                   ],
                 },
@@ -100,9 +162,9 @@ describe("DocsClient.getDocument", () => {
         suggestionsViewMode: "SUGGESTIONS_INLINE",
       }),
     );
-    expect(mockDocs.documents.get.mock.calls[0][0].fields).toContain("documentTab(");
-    expect(mockDocs.documents.get.mock.calls[0][0].fields).toContain(",lists)");
-    expect(mockDocs.documents.get.mock.calls[0][0].fields).not.toContain("lists(listProperties");
+    expect(mockDocs.documents.get.mock.calls[1][0].fields).toContain("documentTab(");
+    expect(mockDocs.documents.get.mock.calls[1][0].fields).toContain(",lists)");
+    expect(mockDocs.documents.get.mock.calls[1][0].fields).not.toContain("lists(listProperties");
     expect(result).toEqual(
       expect.objectContaining({
         documentId: "doc1",
@@ -123,6 +185,8 @@ describe("DocsClient.getDocument", () => {
         text: "Hello\n",
         namedStyleType: "HEADING_1",
         alignment: "CENTER",
+        indentStart: 18,
+        spaceBelow: 6,
       }),
     );
     expect(result.tabs[0].paragraphs?.[1].elements[0]).toEqual(
@@ -131,6 +195,76 @@ describe("DocsClient.getDocument", () => {
         placeholderKind: "table",
       }),
     );
+    expect(result.tabs[0].blocks?.[1]).toEqual(
+      expect.objectContaining({
+        type: "table",
+        tablePath: [1],
+        rows: 1,
+        columns: 2,
+        columnWidths: [120, 180],
+      }),
+    );
+    expect((result.tabs[0].blocks?.[1] as any).tableRows[0].cells).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          rowIndex: 0,
+          columnIndex: 0,
+          text: "A\n",
+          style: expect.objectContaining({
+            borderTop: { color: "#FF0000", width: 2, dashStyle: "SOLID" },
+          }),
+        }),
+        expect.objectContaining({ rowIndex: 0, columnIndex: 1, text: "B\n" }),
+      ]),
+    );
+  });
+
+  it("retries a structured read once when the document changes during the fetch", async () => {
+    const mockDocs = makeMockDocs();
+    const mockDrive = makeMockDrive();
+    const contentResponse = (text: string) => ({
+      data: {
+        documentId: "doc1",
+        title: "Doc",
+        tabs: [{
+          tabProperties: { tabId: "tab-1", title: "Main", index: 0, nestingLevel: 0 },
+          documentTab: {
+            body: {
+              content: [{
+                startIndex: 1,
+                endIndex: text.length + 2,
+                paragraph: {
+                  elements: [{
+                    startIndex: 1,
+                    endIndex: text.length + 2,
+                    textRun: { content: `${text}\n` },
+                  }],
+                },
+              }],
+            },
+            lists: {},
+          },
+        }],
+      },
+    });
+    mockDocs.documents.get
+      .mockResolvedValueOnce({ data: { revisionId: "rev-1" } })
+      .mockResolvedValueOnce(contentResponse("old"))
+      .mockResolvedValueOnce({ data: { revisionId: "rev-2" } })
+      .mockResolvedValueOnce(contentResponse("new"))
+      .mockResolvedValueOnce({ data: { revisionId: "rev-2" } });
+    const client = makeClient(mockDocs, mockDrive);
+
+    const result = await client.getDocument("doc1", {
+      includeContent: true,
+      tabId: "tab-1",
+      maxChars: 100,
+      maxParagraphs: 10,
+    });
+
+    expect(result.revisionId).toBe("rev-2");
+    expect(result.tabs[0].paragraphs?.[0].displayText).toBe("new");
+    expect(mockDocs.documents.get).toHaveBeenCalledTimes(5);
   });
 
   it("uses metadata-first field selection when content is omitted", async () => {
@@ -237,6 +371,22 @@ describe("DocsClient writes", () => {
       },
     });
     expect(result.revisionId).toBe("rev-2");
+  });
+
+  it("translates a rejected required revision into STALE_DOCUMENT", async () => {
+    const mockDocs = makeMockDocs();
+    const mockDrive = makeMockDrive();
+    mockDocs.documents.batchUpdate.mockRejectedValue(
+      new Error("The requiredRevisionId does not match the current revision"),
+    );
+    const client = makeClient(mockDocs, mockDrive);
+
+    await expect(client.batchUpdateRequests(
+      "doc1",
+      [{ insertText: { location: { index: 1 }, text: "x" } }],
+      "rev-1",
+      "strict",
+    )).rejects.toThrow("STALE_DOCUMENT");
   });
 
   it("shapes replaceAllText requests with tab scoping and merge write control", async () => {

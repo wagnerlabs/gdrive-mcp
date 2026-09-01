@@ -593,6 +593,10 @@ describe("SheetsClient.parseA1Range", () => {
     expect(() => SheetsClient.parseA1Range("Sheet1!A:C")).toThrow(DriveAPIError);
   });
 
+  it("rejects reversed ranges", () => {
+    expect(() => SheetsClient.parseA1Range("Sheet1!C5:A1")).toThrow(DriveAPIError);
+  });
+
   it("rejects ranges without sheet name", () => {
     expect(() => SheetsClient.parseA1Range("A1:C5")).toThrow(DriveAPIError);
   });

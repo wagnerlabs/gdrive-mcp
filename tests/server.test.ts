@@ -43,6 +43,7 @@ function makeMockDocsClient(): DocsClient {
     updateTextStyle: vi.fn(),
     updateParagraphStyle: vi.fn(),
     updateList: vi.fn(),
+    batchUpdateRequests: vi.fn(),
     renameDocument: vi.fn(),
     duplicateDocument: vi.fn(),
   } as unknown as DocsClient;
@@ -63,18 +64,20 @@ function getTools(server: ReturnType<typeof createServer>) {
 // ── Tool registration ────────────────────────────────────────────────
 
 describe("createServer — tool registration", () => {
-  it("registers all 26 tools", () => {
+  it("registers all 34 tools", () => {
     const { server } = makeServer();
     const names = Object.keys(getTools(server));
 
-    expect(names).toHaveLength(26);
+    expect(names).toHaveLength(34);
     for (const name of [
       "gdrive_search",
       "gdrive_get_file",
       "gdrive_read_file",
       "gdrive_list_files",
       "gdrive_get_spreadsheet_info",
+      "gdrive_get_sheet_values",
       "gdrive_get_document_info",
+      "gdrive_get_document_content",
       "gdrive_create_sheet",
       "gdrive_update_sheet",
       "gdrive_append_sheet",
@@ -86,6 +89,12 @@ describe("createServer — tool registration", () => {
       "gdrive_insert_rows_columns",
       "gdrive_delete_rows_columns",
       "gdrive_create_doc",
+      "gdrive_insert_doc_content",
+      "gdrive_batch_update_doc",
+      "gdrive_insert_doc_table",
+      "gdrive_update_doc_table_cells",
+      "gdrive_modify_doc_table",
+      "gdrive_format_doc_table",
       "gdrive_insert_doc_text",
       "gdrive_replace_doc_text",
       "gdrive_replace_all_doc_text",
@@ -108,7 +117,9 @@ describe("createServer — tool registration", () => {
       "gdrive_read_file",
       "gdrive_list_files",
       "gdrive_get_spreadsheet_info",
+      "gdrive_get_sheet_values",
       "gdrive_get_document_info",
+      "gdrive_get_document_content",
     ]) {
       const ann = tools[name].annotations;
       expect(ann?.readOnlyHint, `${name} readOnlyHint`).toBe(true);
@@ -133,6 +144,12 @@ describe("createServer — tool registration", () => {
       gdrive_insert_rows_columns: { readOnly: false, destructive: false, idempotent: false },
       gdrive_delete_rows_columns: { readOnly: false, destructive: true, idempotent: false },
       gdrive_create_doc: { readOnly: false, destructive: false, idempotent: false },
+      gdrive_insert_doc_content: { readOnly: false, destructive: false, idempotent: false },
+      gdrive_batch_update_doc: { readOnly: false, destructive: true, idempotent: false },
+      gdrive_insert_doc_table: { readOnly: false, destructive: false, idempotent: false },
+      gdrive_update_doc_table_cells: { readOnly: false, destructive: true, idempotent: true },
+      gdrive_modify_doc_table: { readOnly: false, destructive: true, idempotent: false },
+      gdrive_format_doc_table: { readOnly: false, destructive: false, idempotent: true },
       gdrive_insert_doc_text: { readOnly: false, destructive: false, idempotent: false },
       gdrive_replace_doc_text: { readOnly: false, destructive: true, idempotent: false },
       gdrive_replace_all_doc_text: { readOnly: false, destructive: true, idempotent: true },
@@ -409,6 +426,59 @@ describe("read-before-write guard", () => {
     );
     expect(result.isError).toBe(true);
     expect(result.content[0].text).toContain("must read this spreadsheet");
+  });
+});
+
+// ── Bounded range reads ──────────────────────────────────────────────
+
+describe("gdrive_get_sheet_values", () => {
+  it("returns a rectangular range and unlocks a subsequent write", async () => {
+    const { server, sheets } = makeServer();
+    const tools = getTools(server);
+    (sheets.getValues as ReturnType<typeof vi.fn>).mockResolvedValue([["a"], ["b", "c"]]);
+    (sheets.updateValues as ReturnType<typeof vi.fn>).mockResolvedValue({
+      spreadsheetId: "s1",
+      updatedRange: "Sheet1!A1:B2",
+      updatedRows: 2,
+      updatedColumns: 2,
+      updatedCells: 4,
+    });
+
+    const read = await tools["gdrive_get_sheet_values"].handler(
+      { spreadsheet_id: "s1", range: "Sheet1!A1:B2" },
+      {},
+    );
+    expect(JSON.parse(read.content[0].text).values).toEqual([
+      ["a", ""],
+      ["b", "c"],
+    ]);
+
+    const write = await tools["gdrive_update_sheet"].handler(
+      {
+        spreadsheet_id: "s1",
+        range: "Sheet1!A1:B2",
+        values: [["x", "y"], ["z", "w"]],
+        value_input_option: "RAW",
+        include_previous_values: false,
+      },
+      {},
+    );
+    expect(write.isError).toBeUndefined();
+    expect(sheets.updateValues).toHaveBeenCalled();
+  });
+
+  it("rejects ranges larger than 10000 cells", async () => {
+    const { server, sheets } = makeServer();
+    const tools = getTools(server);
+
+    const result = await tools["gdrive_get_sheet_values"].handler(
+      { spreadsheet_id: "s1", range: "Sheet1!A1:Z1000" },
+      {},
+    );
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("at most 10000 cells");
+    expect(sheets.getValues).not.toHaveBeenCalled();
   });
 });
 

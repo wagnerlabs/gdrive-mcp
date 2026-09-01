@@ -1,6 +1,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { ToolAnnotations } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
+import { docs_v1 } from "googleapis";
 import { DriveClient, DriveAPIError } from "./client.js";
 import { SheetsClient, FormatOptions } from "./sheets-client.js";
 import {
@@ -9,7 +10,10 @@ import {
   DocParagraphAlignment,
   DocsClient,
   DocsConflictMode,
+  NormalizedDocBlock,
   NormalizedDocElement,
+  NormalizedDocParagraph,
+  NormalizedDocTableBlock,
   NormalizedDocTab,
   NormalizedDocument,
 } from "./docs-client.js";
@@ -24,6 +28,7 @@ const DOC_PLACEHOLDER_CHAR = "\uFFFC";
 const DOC_TERMINAL_NEWLINE_WARNING =
   "Excluded the trailing paragraph newline from the resolved range because Google Docs cannot delete the final newline of a segment.";
 const HEX_COLOR_PATTERN = /^#?[0-9A-Fa-f]{6}$/;
+const DOC_RESPONSE_MAX_BYTES = 48_000;
 
 function errorResult(err: unknown): {
   content: Array<{ type: "text"; text: string }>;
@@ -55,6 +60,12 @@ function documentUrl(id: string): string {
   return `https://docs.google.com/document/d/${id}/edit`;
 }
 
+function docBulletPreset(preset: Exclude<DocListPreset, "REMOVE">): string {
+  if (preset === "CHECKBOX") return "BULLET_CHECKBOX";
+  if (preset === "NUMBERED") return "NUMBERED_DECIMAL_ALPHA_ROMAN";
+  return "BULLET_DISC_CIRCLE_SQUARE";
+}
+
 function padValues(
   fetched: unknown[][],
   numRows: number,
@@ -77,6 +88,114 @@ function describeShape(matrix: unknown[][]): string {
   const rows = matrix.length;
   const cols = rows > 0 ? Math.max(0, ...matrix.map((r) => (r as unknown[]).length)) : 0;
   return `${rows}x${cols}`;
+}
+
+interface DocumentPageToken {
+  documentId: string;
+  revisionId: string;
+  tabId: string;
+  offset: number;
+}
+
+function encodeDocumentPageToken(token: DocumentPageToken): string {
+  return Buffer.from(JSON.stringify(token), "utf8").toString("base64url");
+}
+
+function decodeDocumentPageToken(value: string): DocumentPageToken {
+  try {
+    const decoded = JSON.parse(Buffer.from(value, "base64url").toString("utf8"));
+    if (
+      typeof decoded.documentId !== "string" ||
+      typeof decoded.revisionId !== "string" ||
+      typeof decoded.tabId !== "string" ||
+      !Number.isInteger(decoded.offset) ||
+      decoded.offset < 0
+    ) {
+      throw new Error("invalid fields");
+    }
+    return decoded as DocumentPageToken;
+  } catch {
+    throw new Error("Invalid document page_token.");
+  }
+}
+
+function splitLargeDocumentBlocks(blocks: NormalizedDocBlock[]): NormalizedDocBlock[] {
+  const fragments: NormalizedDocBlock[] = [];
+  for (const block of blocks) {
+    if (block.type === "table" && Buffer.byteLength(JSON.stringify(block), "utf8") > 24_000) {
+      for (const row of block.tableRows) {
+        const rowFragment: NormalizedDocTableBlock = {
+          ...block,
+          rows: block.rows,
+          tableRows: [row],
+          fragment: { rowIndex: row.rowIndex },
+        };
+        if (Buffer.byteLength(JSON.stringify(rowFragment), "utf8") <= 24_000) {
+          fragments.push(rowFragment);
+          continue;
+        }
+
+        for (const cell of row.cells) {
+          const cellFragment: NormalizedDocTableBlock = {
+            ...block,
+            tableRows: [{ ...row, cells: [cell] }],
+            fragment: { rowIndex: row.rowIndex, columnIndex: cell.columnIndex },
+          };
+          if (Buffer.byteLength(JSON.stringify(cellFragment), "utf8") <= 24_000) {
+            fragments.push(cellFragment);
+            continue;
+          }
+
+          const chunkSize = 6_000;
+          for (let offset = 0; offset < cell.text.length; offset += chunkSize) {
+            const text = cell.text.slice(offset, offset + chunkSize);
+            fragments.push({
+              ...block,
+              tableRows: [{
+                ...row,
+                cells: [{
+                  ...cell,
+                  startIndex: cell.startIndex + 1 + offset,
+                  endIndex: cell.startIndex + 1 + offset + text.length,
+                  text,
+                  blocks: [],
+                  fragment: {
+                    textOffset: offset,
+                    totalTextLength: cell.text.length,
+                  },
+                }],
+              }],
+              fragment: { rowIndex: row.rowIndex, columnIndex: cell.columnIndex },
+            });
+          }
+        }
+      }
+      continue;
+    }
+    if (block.type === "paragraph" && Buffer.byteLength(JSON.stringify(block), "utf8") > 24_000) {
+      const chunkSize = 8_000;
+      for (let offset = 0; offset < block.text.length; offset += chunkSize) {
+        const text = block.text.slice(offset, offset + chunkSize);
+        fragments.push({
+          ...block,
+          startIndex: block.startIndex + offset,
+          endIndex: block.startIndex + offset + text.length,
+          text,
+          displayText: text.endsWith("\n") ? text.slice(0, -1) : text,
+          elements: [{
+            type: "textRun",
+            startIndex: block.startIndex + offset,
+            endIndex: block.startIndex + offset + text.length,
+            text,
+            textStyle: null,
+          }],
+        } as NormalizedDocParagraph);
+      }
+      continue;
+    }
+    fragments.push(block);
+  }
+  return fragments;
 }
 
 /**
@@ -245,12 +364,15 @@ export function createServer(
 ): McpServer {
   const server = new McpServer({
     name: "gdrive-mcp",
-    version: "0.1.0",
+    version: "0.2.0",
   });
 
   const accessedSpreadsheets = new Set<string>();
   const accessedDocs = new Set<string>();
-  const lastSeenDocRevision = new Map<string, string>();
+  // Only explicit tool reads and successful agent-initiated writes may advance
+  // this map. Internal metadata/content fetches must never authorize a newer
+  // collaborator revision.
+  const observedDocRevision = new Map<string, string>();
   const structuredDocCache = new Map<string, CachedDocumentTabContent>();
 
   function evictStructuredDocumentCache(
@@ -270,8 +392,8 @@ export function createServer(
   function rememberDocumentRead(documentId: string, revisionId?: string): void {
     accessedDocs.add(documentId);
     if (revisionId) {
-      const previousRevisionId = lastSeenDocRevision.get(documentId);
-      lastSeenDocRevision.set(documentId, revisionId);
+      const previousRevisionId = observedDocRevision.get(documentId);
+      observedDocRevision.set(documentId, revisionId);
       if (previousRevisionId !== revisionId) {
         evictStructuredDocumentCache(documentId, revisionId);
       }
@@ -307,7 +429,18 @@ export function createServer(
   function unreadDocumentError(): Error {
     return new Error(
       "You must read this document before writing to it. " +
-        "Use gdrive_read_file or gdrive_get_document_info first.",
+        "Use gdrive_read_file, gdrive_get_document_info, or gdrive_get_document_content first.",
+    );
+  }
+
+  function staleDocumentError(
+    observedRevisionId: string,
+    currentRevisionId: string,
+  ): Error {
+    return new Error(
+      "STALE_DOCUMENT: The document changed after the agent read it. " +
+        `Observed revision ${JSON.stringify(observedRevisionId)}; current revision ${JSON.stringify(currentRevisionId)}. ` +
+        "Read the document again before retrying, or explicitly use conflict_mode:'merge'.",
     );
   }
 
@@ -315,24 +448,27 @@ export function createServer(
     const metadata = await docsClient.getDocument(documentId, {
       includeContent: false,
     });
-    rememberDocumentSnapshot(metadata);
     return metadata;
   }
 
-  async function ensureDocumentRevision(documentId: string): Promise<string> {
-    const cached = lastSeenDocRevision.get(documentId);
+  async function ensureDocumentRevision(
+    documentId: string,
+    conflictMode: DocsConflictMode = "strict",
+  ): Promise<string> {
+    const cached = observedDocRevision.get(documentId);
     if (cached) {
+      if (conflictMode === "strict") {
+        const current = await docsClient.getRevisionId(documentId);
+        if (current && current !== cached) {
+          throw staleDocumentError(cached, current);
+        }
+      }
       return cached;
     }
-
-    const metadata = await fetchDocumentMetadata(documentId);
-    if (!metadata.revisionId) {
-      throw new Error(
-        "Could not determine the current document revision. " +
-          "Make sure you have edit access, then read the document again.",
-      );
-    }
-    return metadata.revisionId;
+    throw new Error(
+      "Could not determine the revision that was explicitly read. " +
+        "Read the document again before editing it.",
+    );
   }
 
   async function resolveDocumentTab(
@@ -478,7 +614,7 @@ export function createServer(
     requestedTabId?: string,
   ): Promise<CachedDocumentTabContent> {
     const { tab } = await resolveDocumentTab(documentId, requestedTabId);
-    const revisionId = lastSeenDocRevision.get(documentId);
+    const revisionId = observedDocRevision.get(documentId);
     if (revisionId) {
       const cached = structuredDocCache.get(docCacheKey(documentId, revisionId, tab.tabId));
       if (cached) {
@@ -492,7 +628,7 @@ export function createServer(
       maxChars: 250_000,
       maxParagraphs: 5_000,
     });
-    rememberDocumentSnapshot(snapshot);
+    cacheStructuredDocument(snapshot);
 
     if (snapshot.contentTruncated) {
       throw new Error(
@@ -517,7 +653,7 @@ export function createServer(
     const search = buildSearchableTabText(snapshotTab);
     const built: CachedDocumentTabContent = {
       documentId,
-      revisionId: snapshot.revisionId ?? lastSeenDocRevision.get(documentId) ?? "",
+      revisionId: snapshot.revisionId ?? observedDocRevision.get(documentId) ?? "",
       tabId: tab.tabId,
       tab: snapshotTab,
       searchableText: search.searchableText,
@@ -714,6 +850,61 @@ export function createServer(
     };
   }
 
+  function collectTables(blocks: NormalizedDocBlock[] | undefined): NormalizedDocTableBlock[] {
+    const tables: NormalizedDocTableBlock[] = [];
+    for (const block of blocks ?? []) {
+      if (block.type !== "table") continue;
+      tables.push(block);
+      for (const row of block.tableRows) {
+        for (const cell of row.cells) {
+          tables.push(...collectTables(cell.blocks));
+        }
+      }
+    }
+    return tables;
+  }
+
+  function resolveTableByPath(
+    snapshot: CachedDocumentTabContent,
+    tablePath: number[],
+  ): NormalizedDocTableBlock {
+    const table = collectTables(snapshot.tab.blocks).find(
+      (candidate) =>
+        candidate.tablePath.length === tablePath.length &&
+        candidate.tablePath.every((part, index) => part === tablePath[index]),
+    );
+    if (!table) {
+      throw new Error(
+        `Table path [${tablePath.join(", ")}] was not found in tab "${snapshot.tab.title}". Reread the tab content to inspect current table paths.`,
+      );
+    }
+    return table;
+  }
+
+  function resolveTableCell(
+    table: NormalizedDocTableBlock,
+    rowIndex: number,
+    columnIndex: number,
+  ) {
+    const row = table.tableRows.find((candidate) => candidate.rowIndex === rowIndex);
+    const cell = row?.cells.find((candidate) => candidate.columnIndex === columnIndex);
+    if (!cell) {
+      throw new Error(
+        `Cell (${rowIndex}, ${columnIndex}) does not exist or is covered by a merged cell in table [${table.tablePath.join(", ")}].`,
+      );
+    }
+    return cell;
+  }
+
+  async function refreshTable(
+    documentId: string,
+    tabId: string,
+    tablePath: number[],
+  ): Promise<NormalizedDocTableBlock> {
+    const refreshed = await getStructuredDocumentTab(documentId, tabId);
+    return resolveTableByPath(refreshed, tablePath);
+  }
+
   // ── Read-only Drive tools ──────────────────────────────────────────
 
   server.tool(
@@ -782,7 +973,6 @@ export function createServer(
     async ({ file_id, max_chars }) => {
       try {
         const meta = await driveClient.getFile(file_id);
-        const result = await driveClient.readFile(file_id, max_chars);
         const resolvedTargetId =
           meta.mimeType === "application/vnd.google-apps.shortcut"
             ? meta.shortcutTarget?.id
@@ -791,19 +981,28 @@ export function createServer(
           meta.mimeType === "application/vnd.google-apps.shortcut"
             ? meta.shortcutTarget?.mimeType
             : meta.mimeType;
+        const docRevisionBefore =
+          resolvedTargetMimeType === "application/vnd.google-apps.document" && resolvedTargetId
+            ? await docsClient.getRevisionId(resolvedTargetId).catch(() => undefined)
+            : undefined;
+        const result = await driveClient.readFile(file_id, max_chars);
 
         if (resolvedTargetMimeType === "application/vnd.google-apps.spreadsheet" && resolvedTargetId) {
           accessedSpreadsheets.add(resolvedTargetId);
         }
 
         if (resolvedTargetMimeType === "application/vnd.google-apps.document" && resolvedTargetId) {
-          rememberDocumentRead(resolvedTargetId);
-          try {
-            const revisionId = await docsClient.getRevisionId(resolvedTargetId);
-            rememberDocumentRead(resolvedTargetId, revisionId);
-          } catch {
-            // Preserve Markdown read behavior even if revision caching is unavailable.
+          const revisionAfter = await docsClient.getRevisionId(resolvedTargetId).catch(() => undefined);
+          if (
+            docRevisionBefore &&
+            revisionAfter &&
+            docRevisionBefore !== revisionAfter
+          ) {
+            throw new Error(
+              "The document changed while its Markdown export was being read. Read it again before editing.",
+            );
           }
+          rememberDocumentRead(resolvedTargetId, revisionAfter ?? docRevisionBefore);
         }
 
         return {
@@ -880,6 +1079,43 @@ export function createServer(
     },
   );
 
+  server.tool(
+    "gdrive_get_sheet_values",
+    "Read a bounded A1 range from a spreadsheet. Use the returned values as expected_current_values for safe targeted updates.",
+    {
+      spreadsheet_id: z.string().describe("Google Sheets spreadsheet ID"),
+      range: z.string().describe("Bounded A1 notation with a sheet name, e.g. 'Sheet1!A1:C20'"),
+    },
+    SAFE,
+    async ({ spreadsheet_id, range }) => {
+      try {
+        const parsed = SheetsClient.parseA1Range(range);
+        const cells =
+          (parsed.endRow - parsed.startRow + 1) *
+          (parsed.endCol - parsed.startCol + 1);
+        if (cells > 10_000) {
+          throw new Error(
+            `Range contains ${cells} cells; read at most 10000 cells per call.`,
+          );
+        }
+        const values = await sheetsClient.getValues(spreadsheet_id, range);
+        accessedSpreadsheets.add(spreadsheet_id);
+        return jsonResult({
+          spreadsheetId: spreadsheet_id,
+          spreadsheetUrl: spreadsheetUrl(spreadsheet_id),
+          range,
+          values: padValues(
+            values,
+            parsed.endRow - parsed.startRow + 1,
+            parsed.endCol - parsed.startCol + 1,
+          ),
+        });
+      } catch (err) {
+        return errorResult(err);
+      }
+    },
+  );
+
   // ── Read-only Docs tool ────────────────────────────────────────────
 
   server.tool(
@@ -918,11 +1154,112 @@ export function createServer(
         const info = await docsClient.getDocument(document_id, {
           includeContent: include_content,
           tabId: tab_id,
-          maxChars: max_chars,
-          maxParagraphs: max_paragraphs,
+          maxChars: Math.min(max_chars, 20_000),
+          maxParagraphs: Math.min(max_paragraphs, 200),
         });
         rememberDocumentSnapshot(info);
         return jsonResult(info);
+      } catch (err) {
+        return errorResult(err);
+      }
+    },
+  );
+
+  server.tool(
+    "gdrive_get_document_content",
+    "Read one Google Docs tab as bounded, paginated structured blocks. Returns paragraphs and native tables with a revision-bound nextPageToken.",
+    {
+      document_id: z.string().describe("Google Docs document ID"),
+      tab_id: z.string().describe("Tab ID returned by gdrive_get_document_info"),
+      page_token: z.string().optional().describe("Revision-bound continuation token from the previous page"),
+      max_blocks: z.number().int().min(1).max(200).default(50),
+    },
+    SAFE,
+    async ({ document_id, tab_id, page_token, max_blocks }) => {
+      try {
+        const decoded = page_token ? decodeDocumentPageToken(page_token) : undefined;
+        if (
+          decoded &&
+          (decoded.documentId !== document_id || decoded.tabId !== tab_id)
+        ) {
+          throw new Error("page_token belongs to a different document or tab.");
+        }
+
+        const info = await docsClient.getDocument(document_id, {
+          includeContent: true,
+          tabId: tab_id,
+          maxChars: 50_000_000,
+          maxParagraphs: 1_000_000,
+        });
+        if (!info.revisionId) {
+          throw new Error("Could not determine the document revision.");
+        }
+        if (decoded && decoded.revisionId !== info.revisionId) {
+          throw new Error(
+            "STALE_PAGE_TOKEN: The document changed between content pages. Restart the read from the first page.",
+          );
+        }
+
+        const tab = info.tabs.find((candidate) => candidate.tabId === tab_id);
+        if (!tab) {
+          throw new Error(`Tab "${tab_id}" not found in document.`);
+        }
+        const allBlocks = splitLargeDocumentBlocks(tab.blocks ?? []);
+        const offset = decoded?.offset ?? 0;
+        const blocks: NormalizedDocBlock[] = [];
+
+        for (let index = offset; index < allBlocks.length && blocks.length < max_blocks; index++) {
+          const candidate = [...blocks, allBlocks[index]];
+          const probe = {
+            documentId: info.documentId,
+            title: info.title,
+            documentUrl: info.documentUrl,
+            revisionId: info.revisionId,
+            tab: {
+              tabId: tab.tabId,
+              title: tab.title,
+              blocks: candidate,
+            },
+            nextPageToken: "x".repeat(256),
+          };
+          if (
+            blocks.length > 0 &&
+            Buffer.byteLength(JSON.stringify(probe, null, 2), "utf8") > DOC_RESPONSE_MAX_BYTES
+          ) {
+            break;
+          }
+          blocks.push(allBlocks[index]);
+        }
+
+        if (blocks.length === 0 && offset < allBlocks.length) {
+          throw new Error(
+            "A single document block exceeds the safe MCP response limit. Narrow the content or split the oversized table cell.",
+          );
+        }
+
+        const nextOffset = offset + blocks.length;
+        const nextPageToken = nextOffset < allBlocks.length
+          ? encodeDocumentPageToken({
+              documentId: info.documentId,
+              revisionId: info.revisionId,
+              tabId: tab.tabId,
+              offset: nextOffset,
+            })
+          : undefined;
+
+        rememberDocumentSnapshot(info);
+        return jsonResult({
+          documentId: info.documentId,
+          title: info.title,
+          documentUrl: info.documentUrl,
+          revisionId: info.revisionId,
+          tab: {
+            tabId: tab.tabId,
+            title: tab.title,
+            blocks,
+          },
+          nextPageToken,
+        });
       } catch (err) {
         return errorResult(err);
       }
@@ -1006,7 +1343,7 @@ export function createServer(
         return errorResult(
           new Error(
             "You must read this spreadsheet before writing to it. " +
-              "Use gdrive_read_file or gdrive_get_spreadsheet_info first.",
+              "Use gdrive_read_file, gdrive_get_spreadsheet_info, or gdrive_get_sheet_values first.",
           ),
         );
       }
@@ -1026,7 +1363,12 @@ export function createServer(
               values,
             );
             if (mismatch) {
-              return errorResult(new Error(mismatch));
+              return errorResult(
+                new Error(
+                  `STALE_SHEET_VALUES for ${range}: ${mismatch}\n` +
+                    `Expected values: ${JSON.stringify(expected_current_values)}`,
+                ),
+              );
             }
           }
         }
@@ -1527,6 +1869,96 @@ export function createServer(
   const docListPresetSchema = z
     .enum(["BULLETED", "NUMBERED", "CHECKBOX", "REMOVE"])
     .describe("High-level list preset or REMOVE to clear bullets");
+  const docTextSegmentSchema = z.object({
+    text: z.string(),
+    bold: z.boolean().optional(),
+    italic: z.boolean().optional(),
+    underline: z.boolean().optional(),
+    strikethrough: z.boolean().optional(),
+    font_family: z.string().optional(),
+    font_size: z.number().positive().optional(),
+    foreground_color: docColorSchema.optional(),
+    background_color: docColorSchema.optional(),
+    link_url: z.string().url().optional(),
+  });
+  const docContentBlockSchema = z.object({
+    segments: z.array(docTextSegmentSchema).min(1),
+    named_style_type: docNamedStyleSchema.optional(),
+    alignment: docAlignmentSchema.optional(),
+    indent_start_points: z.number().nonnegative().optional(),
+    indent_end_points: z.number().nonnegative().optional(),
+    indent_first_line_points: z.number().optional(),
+    space_above_points: z.number().nonnegative().optional(),
+    space_below_points: z.number().nonnegative().optional(),
+    line_spacing: z.number().positive().optional(),
+    list: z.object({
+      preset: z.enum(["BULLETED", "NUMBERED", "CHECKBOX"]),
+      nesting_level: z.number().int().min(0).max(8).default(0),
+    }).optional(),
+  });
+  const docBatchTargetFields = {
+    target_text: z.string(),
+    occurrence: z.number().int().min(1).optional(),
+    match_case: z.boolean().default(true),
+    expected_text: z.string().optional(),
+  };
+  const docBatchOperationSchema = z.discriminatedUnion("type", [
+    z.object({
+      type: z.literal("replace"),
+      ...docBatchTargetFields,
+      replacement_text: z.string(),
+    }),
+    z.object({
+      type: z.literal("delete"),
+      ...docBatchTargetFields,
+    }),
+    z.object({
+      type: z.literal("text_style"),
+      ...docBatchTargetFields,
+      bold: z.boolean().optional(),
+      italic: z.boolean().optional(),
+      underline: z.boolean().optional(),
+      strikethrough: z.boolean().optional(),
+      foreground_color: docColorSchema.optional(),
+      background_color: docColorSchema.optional(),
+      link_url: z.string().url().optional(),
+    }),
+    z.object({
+      type: z.literal("paragraph_style"),
+      ...docBatchTargetFields,
+      named_style_type: docNamedStyleSchema.optional(),
+      alignment: docAlignmentSchema.optional(),
+    }),
+    z.object({
+      type: z.literal("list"),
+      ...docBatchTargetFields,
+      preset: docListPresetSchema,
+    }),
+  ]);
+  const docTablePathSchema = z.array(z.number().int().min(1)).min(1).describe(
+    "One-based table path returned by gdrive_get_document_content, e.g. [2] or [2,1]",
+  );
+  const docTableStructureOperationSchema = z.discriminatedUnion("type", [
+    z.object({ type: z.literal("insert_row"), row_index: z.number().int().min(0), position: z.enum(["before", "after"]) }),
+    z.object({ type: z.literal("delete_row"), row_index: z.number().int().min(0) }),
+    z.object({ type: z.literal("insert_column"), column_index: z.number().int().min(0), position: z.enum(["before", "after"]) }),
+    z.object({ type: z.literal("delete_column"), column_index: z.number().int().min(0) }),
+    z.object({
+      type: z.literal("merge"),
+      start_row: z.number().int().min(0),
+      start_column: z.number().int().min(0),
+      row_span: z.number().int().min(1),
+      column_span: z.number().int().min(1),
+    }),
+    z.object({
+      type: z.literal("unmerge"),
+      start_row: z.number().int().min(0),
+      start_column: z.number().int().min(0),
+      row_span: z.number().int().min(1),
+      column_span: z.number().int().min(1),
+    }),
+    z.object({ type: z.literal("delete_table") }),
+  ]);
 
   server.tool(
     "gdrive_create_doc",
@@ -1549,6 +1981,987 @@ export function createServer(
         const result = await docsClient.createDocument(title, folder_id);
         rememberDocumentRead(result.documentId, result.revisionId);
         return jsonResult(result);
+      } catch (err) {
+        return errorResult(err);
+      }
+    },
+  );
+
+  server.tool(
+    "gdrive_insert_doc_content",
+    "Insert deterministic rich paragraph blocks in one revision-controlled operation. Supports styled text segments, headings, spacing, indentation, and nested native lists.",
+    {
+      document_id: z.string().describe("Google Docs document ID"),
+      tab_id: z.string().optional().describe("Optional tab ID; defaults to the first tab"),
+      blocks: z.array(docContentBlockSchema).min(1).max(200),
+      index: z.number().int().min(0).optional(),
+      position: z.enum(["start", "end"]).optional(),
+      before_text: z.string().optional(),
+      after_text: z.string().optional(),
+      occurrence: z.number().int().min(1).optional(),
+      match_case: z.boolean().default(true),
+      inherit_neighbor_style: z.boolean().default(false),
+      conflict_mode: docConflictModeSchema,
+    },
+    {
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: true,
+    } satisfies ToolAnnotations,
+    async ({
+      document_id,
+      tab_id,
+      blocks,
+      index,
+      position,
+      before_text,
+      after_text,
+      occurrence,
+      match_case,
+      inherit_neighbor_style,
+      conflict_mode,
+    }) => {
+      if (!accessedDocs.has(document_id)) {
+        return errorResult(unreadDocumentError());
+      }
+      try {
+        const target = await resolveInsertTarget({
+          documentId: document_id,
+          tabId: tab_id,
+          index,
+          position,
+          beforeText: before_text,
+          afterText: after_text,
+          occurrence,
+          matchCase: match_case,
+        });
+        const snapshot = await getStructuredDocumentTab(document_id, target.tabId);
+        const insertionIndex = target.atEnd
+          ? segmentTerminalNewlineIndex(snapshot) ?? firstInsertableTextIndex(snapshot) ?? 1
+          : target.index!;
+
+        const layouts: Array<{
+          startIndex: number;
+          endIndex: number;
+          textStartIndex: number;
+          segmentRanges: Array<{ startIndex: number; endIndex: number; segment: typeof blocks[number]["segments"][number] }>;
+          block: typeof blocks[number];
+        }> = [];
+        let insertedText = "";
+        let cursor = insertionIndex;
+        for (const block of blocks) {
+          const tabs = block.list ? "\t".repeat(block.list.nesting_level) : "";
+          const blockStart = cursor;
+          insertedText += tabs;
+          cursor += tabs.length;
+          const textStartIndex = cursor;
+          const segmentRanges = [];
+          for (const segment of block.segments) {
+            const startIndex = cursor;
+            insertedText += segment.text;
+            cursor += segment.text.length;
+            segmentRanges.push({ startIndex, endIndex: cursor, segment });
+          }
+          if (!insertedText.endsWith("\n")) {
+            insertedText += "\n";
+            cursor += 1;
+          }
+          layouts.push({
+            startIndex: blockStart,
+            endIndex: cursor,
+            textStartIndex,
+            segmentRanges,
+            block,
+          });
+        }
+
+        const requests: docs_v1.Schema$Request[] = [{
+          insertText: {
+            location: { tabId: target.tabId, index: insertionIndex },
+            text: insertedText,
+          },
+        }];
+
+        if (!inherit_neighbor_style) {
+          requests.push({
+            updateTextStyle: {
+              range: {
+                tabId: target.tabId,
+                startIndex: insertionIndex,
+                endIndex: insertionIndex + insertedText.length,
+              },
+              textStyle: {},
+              fields: "bold,italic,underline,strikethrough,weightedFontFamily,fontSize,foregroundColor,backgroundColor,link",
+            },
+          });
+          for (const layout of layouts.filter((item) => !item.block.list)) {
+            requests.push({
+              deleteParagraphBullets: {
+                range: {
+                  tabId: target.tabId,
+                  startIndex: layout.startIndex,
+                  endIndex: layout.endIndex,
+                },
+              },
+            });
+          }
+        }
+
+        for (const layout of layouts) {
+          const paragraphStyle: docs_v1.Schema$ParagraphStyle = {};
+          const fields: string[] = [];
+          if (layout.block.named_style_type) {
+            paragraphStyle.namedStyleType = layout.block.named_style_type;
+            fields.push("namedStyleType");
+          } else if (!inherit_neighbor_style) {
+            paragraphStyle.namedStyleType = "NORMAL_TEXT";
+            fields.push("namedStyleType");
+          }
+          if (layout.block.alignment) {
+            paragraphStyle.alignment = layout.block.alignment;
+            fields.push("alignment");
+          }
+          const dimensions: Array<[number | undefined, keyof docs_v1.Schema$ParagraphStyle, string]> = [
+            [layout.block.indent_start_points, "indentStart", "indentStart"],
+            [layout.block.indent_end_points, "indentEnd", "indentEnd"],
+            [layout.block.indent_first_line_points, "indentFirstLine", "indentFirstLine"],
+            [layout.block.space_above_points, "spaceAbove", "spaceAbove"],
+            [layout.block.space_below_points, "spaceBelow", "spaceBelow"],
+          ];
+          for (const [value, key, field] of dimensions) {
+            if (value !== undefined) {
+              (paragraphStyle as Record<string, unknown>)[key] = { magnitude: value, unit: "PT" };
+              fields.push(field);
+            } else if (!inherit_neighbor_style && (field === "indentStart" || field === "indentFirstLine")) {
+              fields.push(field);
+            }
+          }
+          if (layout.block.line_spacing !== undefined) {
+            paragraphStyle.lineSpacing = layout.block.line_spacing;
+            fields.push("lineSpacing");
+          }
+          if (fields.length > 0) {
+            requests.push({
+              updateParagraphStyle: {
+                range: { tabId: target.tabId, startIndex: layout.startIndex, endIndex: layout.endIndex },
+                paragraphStyle,
+                fields: fields.join(","),
+              },
+            });
+          }
+
+          for (const range of layout.segmentRanges) {
+            const style: docs_v1.Schema$TextStyle = {};
+            const styleFields: string[] = [];
+            const segment = range.segment;
+            for (const [field, value] of [
+              ["bold", segment.bold],
+              ["italic", segment.italic],
+              ["underline", segment.underline],
+              ["strikethrough", segment.strikethrough],
+            ] as const) {
+              if (value !== undefined) {
+                (style as Record<string, unknown>)[field] = value;
+                styleFields.push(field);
+              }
+            }
+            if (segment.font_family) {
+              style.weightedFontFamily = { fontFamily: segment.font_family };
+              styleFields.push("weightedFontFamily.fontFamily");
+            }
+            if (segment.font_size !== undefined) {
+              style.fontSize = { magnitude: segment.font_size, unit: "PT" };
+              styleFields.push("fontSize");
+            }
+            if (segment.foreground_color) {
+              style.foregroundColor = DocsClient.hexToOptionalColor(segment.foreground_color);
+              styleFields.push("foregroundColor");
+            }
+            if (segment.background_color) {
+              style.backgroundColor = DocsClient.hexToOptionalColor(segment.background_color);
+              styleFields.push("backgroundColor");
+            }
+            if (segment.link_url) {
+              style.link = { url: segment.link_url };
+              styleFields.push("link");
+            }
+            if (styleFields.length > 0 && range.endIndex > range.startIndex) {
+              requests.push({
+                updateTextStyle: {
+                  range: { tabId: target.tabId, startIndex: range.startIndex, endIndex: range.endIndex },
+                  textStyle: style,
+                  fields: styleFields.join(","),
+                },
+              });
+            }
+          }
+        }
+
+        const listGroups: Array<{ preset: "BULLETED" | "NUMBERED" | "CHECKBOX"; startIndex: number; endIndex: number }> = [];
+        for (const layout of layouts) {
+          if (!layout.block.list) continue;
+          const previous = listGroups[listGroups.length - 1];
+          if (previous && previous.preset === layout.block.list.preset && previous.endIndex === layout.startIndex) {
+            previous.endIndex = layout.endIndex;
+          } else {
+            listGroups.push({
+              preset: layout.block.list.preset,
+              startIndex: layout.startIndex,
+              endIndex: layout.endIndex,
+            });
+          }
+        }
+        for (const group of listGroups.sort((a, b) => b.startIndex - a.startIndex)) {
+          requests.push({
+            createParagraphBullets: {
+              range: { tabId: target.tabId, startIndex: group.startIndex, endIndex: group.endIndex },
+              bulletPreset: docBulletPreset(group.preset),
+            },
+          });
+        }
+
+        const revisionId = await ensureDocumentRevision(document_id, conflict_mode as DocsConflictMode);
+        const result = await docsClient.batchUpdateRequests(
+          document_id,
+          requests,
+          revisionId,
+          conflict_mode as DocsConflictMode,
+          false,
+        );
+        rememberDocumentRead(document_id, result.revisionId);
+        return jsonResult({
+          documentId: document_id,
+          documentUrl: documentUrl(document_id),
+          tabId: target.tabId,
+          revisionId: result.revisionId,
+          insertedRange: {
+            startIndex: insertionIndex,
+            endIndex: insertionIndex + insertedText.length,
+          },
+          blocksInserted: blocks.length,
+        });
+      } catch (err) {
+        return errorResult(err);
+      }
+    },
+  );
+
+  server.tool(
+    "gdrive_batch_update_doc",
+    "Apply up to 100 disjoint anchored text, formatting, paragraph, or list changes against one immutable document snapshot.",
+    {
+      document_id: z.string(),
+      tab_id: z.string().optional(),
+      operations: z.array(docBatchOperationSchema).min(1).max(100),
+      conflict_mode: docConflictModeSchema,
+    },
+    {
+      readOnlyHint: false,
+      destructiveHint: true,
+      idempotentHint: false,
+      openWorldHint: true,
+    } satisfies ToolAnnotations,
+    async ({ document_id, tab_id, operations, conflict_mode }) => {
+      if (!accessedDocs.has(document_id)) {
+        return errorResult(unreadDocumentError());
+      }
+      try {
+        const requests: docs_v1.Schema$Request[] = [];
+        const mutationRanges: Array<{ startIndex: number; endIndex: number }> = [];
+        const resolvedOperations: Array<Record<string, unknown>> = [];
+
+        for (const operation of operations) {
+          const resolved = await resolveDocumentRange({
+            documentId: document_id,
+            tabId: tab_id,
+            targetText: operation.target_text,
+            occurrence: operation.occurrence,
+            matchCase: operation.match_case,
+            expectedText: operation.expected_text,
+          });
+
+          if (operation.type === "replace" || operation.type === "delete") {
+            const normalized = normalizeRangeForTextMutation(resolved);
+            if (
+              mutationRanges.some(
+                (range) =>
+                  range.endIndex > normalized.startIndex &&
+                  range.startIndex < normalized.endIndex,
+              )
+            ) {
+              throw new Error("Batch content mutations must target disjoint ranges.");
+            }
+            mutationRanges.push(normalized);
+            requests.push({
+              deleteContentRange: {
+                range: {
+                  tabId: resolved.tabId,
+                  startIndex: normalized.startIndex,
+                  endIndex: normalized.endIndex,
+                },
+              },
+            });
+            if (operation.type === "replace" && operation.replacement_text.length > 0) {
+              requests.push({
+                insertText: {
+                  location: { tabId: resolved.tabId, index: normalized.startIndex },
+                  text: operation.replacement_text,
+                },
+              });
+            }
+            resolvedOperations.push({
+              type: operation.type,
+              range: { startIndex: normalized.startIndex, endIndex: normalized.endIndex },
+            });
+            continue;
+          }
+
+          if (operation.type === "text_style") {
+            const style: docs_v1.Schema$TextStyle = {};
+            const fields: string[] = [];
+            for (const [field, value] of [
+              ["bold", operation.bold],
+              ["italic", operation.italic],
+              ["underline", operation.underline],
+              ["strikethrough", operation.strikethrough],
+            ] as const) {
+              if (value !== undefined) {
+                (style as Record<string, unknown>)[field] = value;
+                fields.push(field);
+              }
+            }
+            if (operation.foreground_color) {
+              style.foregroundColor = DocsClient.hexToOptionalColor(operation.foreground_color);
+              fields.push("foregroundColor");
+            }
+            if (operation.background_color) {
+              style.backgroundColor = DocsClient.hexToOptionalColor(operation.background_color);
+              fields.push("backgroundColor");
+            }
+            if (operation.link_url) {
+              style.link = { url: operation.link_url };
+              fields.push("link");
+            }
+            if (fields.length === 0) {
+              throw new Error("A text_style operation must include at least one style field.");
+            }
+            requests.push({
+              updateTextStyle: {
+                range: {
+                  tabId: resolved.tabId,
+                  startIndex: resolved.startIndex,
+                  endIndex: resolved.endIndex,
+                },
+                textStyle: style,
+                fields: fields.join(","),
+              },
+            });
+          } else {
+            const paragraphRange = snapRangeToParagraphs(
+              resolved.snapshot,
+              resolved.startIndex,
+              resolved.endIndex,
+            );
+            if (operation.type === "paragraph_style") {
+              const paragraphStyle: docs_v1.Schema$ParagraphStyle = {};
+              const fields: string[] = [];
+              if (operation.named_style_type) {
+                paragraphStyle.namedStyleType = operation.named_style_type;
+                fields.push("namedStyleType");
+              }
+              if (operation.alignment) {
+                paragraphStyle.alignment = operation.alignment;
+                fields.push("alignment");
+              }
+              if (fields.length === 0) {
+                throw new Error("A paragraph_style operation must include a style field.");
+              }
+              requests.push({
+                updateParagraphStyle: {
+                  range: { tabId: resolved.tabId, ...paragraphRange },
+                  paragraphStyle,
+                  fields: fields.join(","),
+                },
+              });
+            } else {
+              requests.push(operation.preset === "REMOVE"
+                ? { deleteParagraphBullets: { range: { tabId: resolved.tabId, ...paragraphRange } } }
+                : {
+                    createParagraphBullets: {
+                      range: { tabId: resolved.tabId, ...paragraphRange },
+                      bulletPreset: docBulletPreset(operation.preset),
+                    },
+                  });
+            }
+          }
+          resolvedOperations.push({
+            type: operation.type,
+            range: { startIndex: resolved.startIndex, endIndex: resolved.endIndex },
+          });
+        }
+
+        const revisionId = await ensureDocumentRevision(document_id, conflict_mode as DocsConflictMode);
+        const result = await docsClient.batchUpdateRequests(
+          document_id,
+          requests,
+          revisionId,
+          conflict_mode as DocsConflictMode,
+          true,
+        );
+        rememberDocumentRead(document_id, result.revisionId);
+        return jsonResult({
+          documentId: document_id,
+          documentUrl: documentUrl(document_id),
+          revisionId: result.revisionId,
+          operations: resolvedOperations,
+        });
+      } catch (err) {
+        return errorResult(rewriteTerminalNewlineMutationError(err));
+      }
+    },
+  );
+
+  server.tool(
+    "gdrive_insert_doc_table",
+    "Insert a native Google Docs table at a position or text anchor and optionally populate its cells.",
+    {
+      document_id: z.string(),
+      tab_id: z.string().optional(),
+      rows: z.number().int().min(1).max(100),
+      columns: z.number().int().min(1).max(100),
+      values: z.array(z.array(z.string())).optional(),
+      index: z.number().int().min(0).optional(),
+      position: z.enum(["start", "end"]).optional(),
+      before_text: z.string().optional(),
+      after_text: z.string().optional(),
+      occurrence: z.number().int().min(1).optional(),
+      match_case: z.boolean().default(true),
+      conflict_mode: docConflictModeSchema,
+    },
+    {
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: true,
+    } satisfies ToolAnnotations,
+    async ({
+      document_id,
+      tab_id,
+      rows,
+      columns,
+      values,
+      index,
+      position,
+      before_text,
+      after_text,
+      occurrence,
+      match_case,
+      conflict_mode,
+    }) => {
+      if (!accessedDocs.has(document_id)) return errorResult(unreadDocumentError());
+      if (rows * columns > 1_000) {
+        return errorResult(new Error("Create at most 1000 table cells per call."));
+      }
+      if (values && (values.length > rows || values.some((row) => row.length > columns))) {
+        return errorResult(new Error("values must fit within the requested table dimensions."));
+      }
+      let insertedTable: { tabId: string; tablePath: number[]; revisionId?: string } | undefined;
+      try {
+        const target = await resolveInsertTarget({
+          documentId: document_id,
+          tabId: tab_id,
+          index,
+          position,
+          beforeText: before_text,
+          afterText: after_text,
+          occurrence,
+          matchCase: match_case,
+        });
+        const revisionId = await ensureDocumentRevision(document_id, conflict_mode as DocsConflictMode);
+        const first = await docsClient.batchUpdateRequests(
+          document_id,
+          [{
+            insertTable: target.atEnd
+              ? {
+                  rows,
+                  columns,
+                  endOfSegmentLocation: { tabId: target.tabId },
+                }
+              : {
+                  rows,
+                  columns,
+                  location: { tabId: target.tabId, index: target.index },
+                },
+          }],
+          revisionId,
+          conflict_mode as DocsConflictMode,
+          false,
+        );
+        rememberDocumentRead(document_id, first.revisionId);
+        insertedTable = {
+          tabId: target.tabId,
+          tablePath: [],
+          revisionId: first.revisionId,
+        };
+
+        const afterInsert = await getStructuredDocumentTab(document_id, target.tabId);
+        const candidates = collectTables(afterInsert.tab.blocks).filter(
+          (table) => table.tablePath.length === 1 && table.rows === rows && table.columns === columns,
+        );
+        const table = target.atEnd
+          ? candidates[candidates.length - 1]
+          : candidates.reduce<NormalizedDocTableBlock | undefined>((best, candidate) => {
+              if (!best) return candidate;
+              const wanted = target.index ?? 0;
+              return Math.abs(candidate.startIndex - wanted) < Math.abs(best.startIndex - wanted)
+                ? candidate
+                : best;
+            }, undefined);
+        if (!table) {
+          throw new Error(
+            "The table was inserted, but its structure could not be resolved. Reread the document before continuing.",
+          );
+        }
+        insertedTable = {
+          tabId: target.tabId,
+          tablePath: table.tablePath,
+          revisionId: first.revisionId,
+        };
+
+        let finalRevisionId = first.revisionId;
+        if (values?.some((row) => row.some((value) => value.length > 0))) {
+          const requests: docs_v1.Schema$Request[] = [];
+          for (let rowIndex = 0; rowIndex < values.length; rowIndex++) {
+            for (let columnIndex = 0; columnIndex < values[rowIndex].length; columnIndex++) {
+              const text = values[rowIndex][columnIndex];
+              if (!text) continue;
+              const cell = resolveTableCell(table, rowIndex, columnIndex);
+              requests.push({
+                insertText: {
+                  location: { tabId: target.tabId, index: cell.startIndex + 1 },
+                  text,
+                },
+              });
+            }
+          }
+          if (requests.length > 0) {
+            const secondRevision = await ensureDocumentRevision(document_id, conflict_mode as DocsConflictMode);
+            const populated = await docsClient.batchUpdateRequests(
+              document_id,
+              requests,
+              secondRevision,
+              conflict_mode as DocsConflictMode,
+              true,
+            );
+            finalRevisionId = populated.revisionId;
+            rememberDocumentRead(document_id, populated.revisionId);
+          }
+        }
+
+        const refreshed = await refreshTable(document_id, target.tabId, table.tablePath);
+        return jsonResult({
+          documentId: document_id,
+          documentUrl: documentUrl(document_id),
+          tabId: target.tabId,
+          revisionId: finalRevisionId,
+          table: refreshed,
+        });
+      } catch (err) {
+        if (insertedTable) {
+          const message = err instanceof Error ? err.message : String(err);
+          const location = insertedTable.tablePath.length > 0
+            ? `at path [${insertedTable.tablePath.join(", ")}]`
+            : "at an unresolved path";
+          return errorResult(
+            new Error(
+              `TABLE_INSERT_PARTIAL: The native table was inserted ${location} ` +
+                `in tab ${JSON.stringify(insertedTable.tabId)}, but a later population or verification step failed: ${message}. ` +
+                "Reread the document before completing the table.",
+            ),
+          );
+        }
+        return errorResult(err);
+      }
+    },
+  );
+
+  server.tool(
+    "gdrive_update_doc_table_cells",
+    "Replace multiple native table cells atomically using table paths and zero-based row/column coordinates.",
+    {
+      document_id: z.string(),
+      tab_id: z.string(),
+      table_path: docTablePathSchema,
+      updates: z.array(z.object({
+        row_index: z.number().int().min(0),
+        column_index: z.number().int().min(0),
+        text: z.string(),
+        expected_text: z.string().optional(),
+      })).min(1).max(500),
+      conflict_mode: docConflictModeSchema,
+    },
+    {
+      readOnlyHint: false,
+      destructiveHint: true,
+      idempotentHint: true,
+      openWorldHint: true,
+    } satisfies ToolAnnotations,
+    async ({ document_id, tab_id, table_path, updates, conflict_mode }) => {
+      if (!accessedDocs.has(document_id)) return errorResult(unreadDocumentError());
+      try {
+        const snapshot = await getStructuredDocumentTab(document_id, tab_id);
+        const table = resolveTableByPath(snapshot, table_path);
+        const seen = new Set<string>();
+        const requests: docs_v1.Schema$Request[] = [];
+        for (const update of updates) {
+          const key = `${update.row_index}:${update.column_index}`;
+          if (seen.has(key)) throw new Error(`Cell ${key} is updated more than once.`);
+          seen.add(key);
+          const cell = resolveTableCell(table, update.row_index, update.column_index);
+          const currentText = cell.text.endsWith("\n") ? cell.text.slice(0, -1) : cell.text;
+          if (update.expected_text !== undefined && update.expected_text !== currentText) {
+            throw new Error(
+              `STALE_TABLE_CELL: Cell (${update.row_index}, ${update.column_index}) contains ${JSON.stringify(currentText)}, not ${JSON.stringify(update.expected_text)}.`,
+            );
+          }
+          const contentStart = cell.startIndex + 1;
+          const contentEnd = Math.max(contentStart, cell.endIndex - 1);
+          if (contentEnd > contentStart) {
+            requests.push({
+              deleteContentRange: {
+                range: { tabId: tab_id, startIndex: contentStart, endIndex: contentEnd },
+              },
+            });
+          }
+          if (update.text.length > 0) {
+            requests.push({
+              insertText: {
+                location: { tabId: tab_id, index: contentStart },
+                text: update.text,
+              },
+            });
+          }
+        }
+        const revisionId = await ensureDocumentRevision(document_id, conflict_mode as DocsConflictMode);
+        const result = await docsClient.batchUpdateRequests(
+          document_id,
+          requests,
+          revisionId,
+          conflict_mode as DocsConflictMode,
+          true,
+        );
+        rememberDocumentRead(document_id, result.revisionId);
+        const refreshed = await refreshTable(document_id, tab_id, table_path);
+        return jsonResult({
+          documentId: document_id,
+          documentUrl: documentUrl(document_id),
+          tabId: tab_id,
+          revisionId: result.revisionId,
+          table: refreshed,
+        });
+      } catch (err) {
+        return errorResult(err);
+      }
+    },
+  );
+
+  server.tool(
+    "gdrive_modify_doc_table",
+    "Insert or delete rows/columns, merge or unmerge cells, or delete a native Google Docs table. Operations run in the supplied order.",
+    {
+      document_id: z.string(),
+      tab_id: z.string(),
+      table_path: docTablePathSchema,
+      operations: z.array(docTableStructureOperationSchema).min(1).max(100),
+      conflict_mode: docConflictModeSchema,
+    },
+    {
+      readOnlyHint: false,
+      destructiveHint: true,
+      idempotentHint: false,
+      openWorldHint: true,
+    } satisfies ToolAnnotations,
+    async ({ document_id, tab_id, table_path, operations, conflict_mode }) => {
+      if (!accessedDocs.has(document_id)) return errorResult(unreadDocumentError());
+      try {
+        const snapshot = await getStructuredDocumentTab(document_id, tab_id);
+        const table = resolveTableByPath(snapshot, table_path);
+        const tableStartLocation = { tabId: tab_id, index: table.startIndex };
+        const requests: docs_v1.Schema$Request[] = operations.map((operation) => {
+          switch (operation.type) {
+            case "insert_row":
+              return {
+                insertTableRow: {
+                  tableCellLocation: {
+                    tableStartLocation,
+                    rowIndex: operation.row_index,
+                    columnIndex: 0,
+                  },
+                  insertBelow: operation.position === "after",
+                },
+              };
+            case "delete_row":
+              return {
+                deleteTableRow: {
+                  tableCellLocation: {
+                    tableStartLocation,
+                    rowIndex: operation.row_index,
+                    columnIndex: 0,
+                  },
+                },
+              };
+            case "insert_column":
+              return {
+                insertTableColumn: {
+                  tableCellLocation: {
+                    tableStartLocation,
+                    rowIndex: 0,
+                    columnIndex: operation.column_index,
+                  },
+                  insertRight: operation.position === "after",
+                },
+              };
+            case "delete_column":
+              return {
+                deleteTableColumn: {
+                  tableCellLocation: {
+                    tableStartLocation,
+                    rowIndex: 0,
+                    columnIndex: operation.column_index,
+                  },
+                },
+              };
+            case "merge":
+            case "unmerge": {
+              const tableRange = {
+                tableCellLocation: {
+                  tableStartLocation,
+                  rowIndex: operation.start_row,
+                  columnIndex: operation.start_column,
+                },
+                rowSpan: operation.row_span,
+                columnSpan: operation.column_span,
+              };
+              return operation.type === "merge"
+                ? { mergeTableCells: { tableRange } }
+                : { unmergeTableCells: { tableRange } };
+            }
+            case "delete_table":
+              return {
+                deleteContentRange: {
+                  range: {
+                    tabId: tab_id,
+                    startIndex: table.startIndex,
+                    endIndex: table.endIndex,
+                  },
+                },
+              };
+          }
+        });
+        const revisionId = await ensureDocumentRevision(document_id, conflict_mode as DocsConflictMode);
+        const result = await docsClient.batchUpdateRequests(
+          document_id,
+          requests,
+          revisionId,
+          conflict_mode as DocsConflictMode,
+          false,
+        );
+        rememberDocumentRead(document_id, result.revisionId);
+        const deleted = operations.some((operation) => operation.type === "delete_table");
+        return jsonResult({
+          documentId: document_id,
+          documentUrl: documentUrl(document_id),
+          tabId: tab_id,
+          revisionId: result.revisionId,
+          deleted,
+          table: deleted ? undefined : await refreshTable(document_id, tab_id, table_path),
+        });
+      } catch (err) {
+        return errorResult(err);
+      }
+    },
+  );
+
+  server.tool(
+    "gdrive_format_doc_table",
+    "Format native table cells, columns, and rows using a table path and zero-based coordinates.",
+    {
+      document_id: z.string(),
+      tab_id: z.string(),
+      table_path: docTablePathSchema,
+      cell_range: z.object({
+        start_row: z.number().int().min(0),
+        start_column: z.number().int().min(0),
+        row_span: z.number().int().min(1),
+        column_span: z.number().int().min(1),
+      }).optional(),
+      background_color: docColorSchema.optional(),
+      content_alignment: z.enum(["TOP", "MIDDLE", "BOTTOM"]).optional(),
+      padding_top_points: z.number().nonnegative().optional(),
+      padding_bottom_points: z.number().nonnegative().optional(),
+      padding_left_points: z.number().nonnegative().optional(),
+      padding_right_points: z.number().nonnegative().optional(),
+      border_color: docColorSchema.optional(),
+      border_width_points: z.number().nonnegative().optional(),
+      border_dash_style: z.enum(["SOLID", "DOT", "DASH"]).optional(),
+      column_widths: z.array(z.object({
+        column_index: z.number().int().min(0),
+        width_points: z.number().min(5),
+      })).max(100).optional(),
+      row_styles: z.array(z.object({
+        row_index: z.number().int().min(0),
+        min_height_points: z.number().nonnegative().optional(),
+        prevent_overflow: z.boolean().optional(),
+      })).max(100).optional(),
+      conflict_mode: docConflictModeSchema,
+    },
+    {
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: true,
+    } satisfies ToolAnnotations,
+    async ({
+      document_id,
+      tab_id,
+      table_path,
+      cell_range,
+      background_color,
+      content_alignment,
+      padding_top_points,
+      padding_bottom_points,
+      padding_left_points,
+      padding_right_points,
+      border_color,
+      border_width_points,
+      border_dash_style,
+      column_widths,
+      row_styles,
+      conflict_mode,
+    }) => {
+      if (!accessedDocs.has(document_id)) return errorResult(unreadDocumentError());
+      try {
+        const snapshot = await getStructuredDocumentTab(document_id, tab_id);
+        const table = resolveTableByPath(snapshot, table_path);
+        const tableStartLocation = { tabId: tab_id, index: table.startIndex };
+        const requests: docs_v1.Schema$Request[] = [];
+        const cellStyle: docs_v1.Schema$TableCellStyle = {};
+        const cellFields: string[] = [];
+        if (background_color) {
+          cellStyle.backgroundColor = DocsClient.hexToOptionalColor(background_color);
+          cellFields.push("backgroundColor");
+        }
+        if (content_alignment) {
+          cellStyle.contentAlignment = content_alignment;
+          cellFields.push("contentAlignment");
+        }
+        for (const [value, key, field] of [
+          [padding_top_points, "paddingTop", "paddingTop"],
+          [padding_bottom_points, "paddingBottom", "paddingBottom"],
+          [padding_left_points, "paddingLeft", "paddingLeft"],
+          [padding_right_points, "paddingRight", "paddingRight"],
+        ] as const) {
+          if (value !== undefined) {
+            (cellStyle as Record<string, unknown>)[key] = { magnitude: value, unit: "PT" };
+            cellFields.push(field);
+          }
+        }
+        if (border_color || border_width_points !== undefined || border_dash_style) {
+          const border: docs_v1.Schema$TableCellBorder = {
+            color: border_color ? DocsClient.hexToOptionalColor(border_color) : undefined,
+            width: border_width_points !== undefined
+              ? { magnitude: border_width_points, unit: "PT" }
+              : undefined,
+            dashStyle: border_dash_style,
+          };
+          cellStyle.borderTop = border;
+          cellStyle.borderBottom = border;
+          cellStyle.borderLeft = border;
+          cellStyle.borderRight = border;
+          cellFields.push("borderTop", "borderBottom", "borderLeft", "borderRight");
+        }
+        if (cellFields.length > 0) {
+          if (!cell_range) {
+            requests.push({
+              updateTableCellStyle: {
+                tableStartLocation,
+                tableCellStyle: cellStyle,
+                fields: cellFields.join(","),
+              },
+            });
+          } else {
+            requests.push({
+              updateTableCellStyle: {
+                tableRange: {
+                  tableCellLocation: {
+                    tableStartLocation,
+                    rowIndex: cell_range.start_row,
+                    columnIndex: cell_range.start_column,
+                  },
+                  rowSpan: cell_range.row_span,
+                  columnSpan: cell_range.column_span,
+                },
+                tableCellStyle: cellStyle,
+                fields: cellFields.join(","),
+              },
+            });
+          }
+        }
+        for (const column of column_widths ?? []) {
+          requests.push({
+            updateTableColumnProperties: {
+              tableStartLocation,
+              columnIndices: [column.column_index],
+              tableColumnProperties: {
+                widthType: "FIXED_WIDTH",
+                width: { magnitude: column.width_points, unit: "PT" },
+              },
+              fields: "widthType,width",
+            },
+          });
+        }
+        for (const row of row_styles ?? []) {
+          const tableRowStyle: docs_v1.Schema$TableRowStyle = {};
+          const fields: string[] = [];
+          if (row.min_height_points !== undefined) {
+            tableRowStyle.minRowHeight = { magnitude: row.min_height_points, unit: "PT" };
+            fields.push("minRowHeight");
+          }
+          if (row.prevent_overflow !== undefined) {
+            tableRowStyle.preventOverflow = row.prevent_overflow;
+            fields.push("preventOverflow");
+          }
+          if (fields.length > 0) {
+            requests.push({
+              updateTableRowStyle: {
+                tableStartLocation,
+                rowIndices: [row.row_index],
+                tableRowStyle,
+                fields: fields.join(","),
+              },
+            });
+          }
+        }
+        if (requests.length === 0) {
+          throw new Error("Provide at least one table formatting change.");
+        }
+        const revisionId = await ensureDocumentRevision(document_id, conflict_mode as DocsConflictMode);
+        const result = await docsClient.batchUpdateRequests(
+          document_id,
+          requests,
+          revisionId,
+          conflict_mode as DocsConflictMode,
+          false,
+        );
+        rememberDocumentRead(document_id, result.revisionId);
+        return jsonResult({
+          documentId: document_id,
+          documentUrl: documentUrl(document_id),
+          tabId: tab_id,
+          revisionId: result.revisionId,
+          table: await refreshTable(document_id, tab_id, table_path),
+        });
       } catch (err) {
         return errorResult(err);
       }
@@ -1627,7 +3040,7 @@ export function createServer(
           occurrence,
           matchCase: match_case,
         });
-        const revisionId = await ensureDocumentRevision(document_id);
+        const revisionId = await ensureDocumentRevision(document_id, conflict_mode as DocsConflictMode);
         const result = await docsClient.insertText({
           documentId: document_id,
           text,
@@ -1719,7 +3132,7 @@ export function createServer(
           expectedText: expected_text,
         });
         const normalized = normalizeRangeForTextMutation(resolved);
-        const revisionId = await ensureDocumentRevision(document_id);
+        const revisionId = await ensureDocumentRevision(document_id, conflict_mode as DocsConflictMode);
         const result = await docsClient.replaceText({
           documentId: document_id,
           text: replacement_text,
@@ -1789,7 +3202,7 @@ export function createServer(
       }
 
       try {
-        const revisionId = await ensureDocumentRevision(document_id);
+        const revisionId = await ensureDocumentRevision(document_id, conflict_mode as DocsConflictMode);
         const scopedTabId = all_tabs
           ? undefined
           : (await resolveDocumentTab(document_id, tab_id)).tab.tabId;
@@ -1886,7 +3299,7 @@ export function createServer(
           expectedText: expected_text,
         });
         const normalized = normalizeRangeForTextMutation(resolved);
-        const revisionId = await ensureDocumentRevision(document_id);
+        const revisionId = await ensureDocumentRevision(document_id, conflict_mode as DocsConflictMode);
         const result = await docsClient.deleteText({
           documentId: document_id,
           tabId: resolved.tabId,
@@ -2003,7 +3416,7 @@ export function createServer(
           occurrence,
           matchCase: match_case,
         });
-        const revisionId = await ensureDocumentRevision(document_id);
+        const revisionId = await ensureDocumentRevision(document_id, conflict_mode as DocsConflictMode);
         const result = await docsClient.updateTextStyle({
           documentId: document_id,
           tabId: resolved.tabId,
@@ -2063,6 +3476,12 @@ export function createServer(
         .describe("Whether target_text matching is case-sensitive"),
       named_style_type: docNamedStyleSchema.optional(),
       alignment: docAlignmentSchema.optional(),
+      indent_start_points: z.number().nonnegative().nullable().optional().describe("Start indent in points, or null to reset"),
+      indent_end_points: z.number().nonnegative().nullable().optional().describe("End indent in points, or null to reset"),
+      indent_first_line_points: z.number().nullable().optional().describe("First-line indent in points, or null to reset"),
+      space_above_points: z.number().nonnegative().nullable().optional().describe("Space above in points, or null to reset"),
+      space_below_points: z.number().nonnegative().nullable().optional().describe("Space below in points, or null to reset"),
+      line_spacing: z.number().positive().nullable().optional().describe("Line spacing percentage, or null to reset"),
       conflict_mode: docConflictModeSchema,
     },
     {
@@ -2081,13 +3500,28 @@ export function createServer(
       match_case,
       named_style_type,
       alignment,
+      indent_start_points,
+      indent_end_points,
+      indent_first_line_points,
+      space_above_points,
+      space_below_points,
+      line_spacing,
       conflict_mode,
     }) => {
       if (!accessedDocs.has(document_id)) {
         return errorResult(unreadDocumentError());
       }
 
-      if (named_style_type === undefined && alignment === undefined) {
+      if (
+        named_style_type === undefined &&
+        alignment === undefined &&
+        indent_start_points === undefined &&
+        indent_end_points === undefined &&
+        indent_first_line_points === undefined &&
+        space_above_points === undefined &&
+        space_below_points === undefined &&
+        line_spacing === undefined
+      ) {
         return errorResult(
           new Error("At least one paragraph style parameter must be provided."),
         );
@@ -2108,7 +3542,7 @@ export function createServer(
           resolved.startIndex,
           resolved.endIndex,
         );
-        const revisionId = await ensureDocumentRevision(document_id);
+        const revisionId = await ensureDocumentRevision(document_id, conflict_mode as DocsConflictMode);
         const result = await docsClient.updateParagraphStyle({
           documentId: document_id,
           tabId: resolved.tabId,
@@ -2116,6 +3550,12 @@ export function createServer(
           endIndex: paragraphRange.endIndex,
           namedStyleType: named_style_type as DocNamedStyleType | undefined,
           alignment: alignment as DocParagraphAlignment | undefined,
+          indentStartPoints: indent_start_points,
+          indentEndPoints: indent_end_points,
+          indentFirstLinePoints: indent_first_line_points,
+          spaceAbovePoints: space_above_points,
+          spaceBelowPoints: space_below_points,
+          lineSpacing: line_spacing,
           revisionId,
           conflictMode: conflict_mode as DocsConflictMode,
         });
@@ -2128,6 +3568,12 @@ export function createServer(
           paragraphRange,
           namedStyleType: named_style_type,
           alignment,
+          indentStartPoints: indent_start_points,
+          indentEndPoints: indent_end_points,
+          indentFirstLinePoints: indent_first_line_points,
+          spaceAbovePoints: space_above_points,
+          spaceBelowPoints: space_below_points,
+          lineSpacing: line_spacing,
         });
       } catch (err) {
         return errorResult(err);
@@ -2158,6 +3604,14 @@ export function createServer(
         .default(true)
         .describe("Whether target_text matching is case-sensitive"),
       preset: docListPresetSchema,
+      nesting_levels: z
+        .array(z.number().int().min(0).max(8))
+        .optional()
+        .describe("One nesting level (0-8) for each selected paragraph"),
+      continue_previous: z
+        .boolean()
+        .default(false)
+        .describe("Require this block to continue an immediately adjacent compatible native list"),
       conflict_mode: docConflictModeSchema,
     },
     {
@@ -2175,6 +3629,8 @@ export function createServer(
       occurrence,
       match_case,
       preset,
+      nesting_levels,
+      continue_previous,
       conflict_mode,
     }) => {
       if (!accessedDocs.has(document_id)) {
@@ -2196,16 +3652,97 @@ export function createServer(
           resolved.startIndex,
           resolved.endIndex,
         );
-        const revisionId = await ensureDocumentRevision(document_id);
-        const result = await docsClient.updateList({
-          documentId: document_id,
-          tabId: resolved.tabId,
-          startIndex: paragraphRange.startIndex,
-          endIndex: paragraphRange.endIndex,
-          preset: preset as DocListPreset,
-          revisionId,
-          conflictMode: conflict_mode as DocsConflictMode,
-        });
+        const revisionId = await ensureDocumentRevision(document_id, conflict_mode as DocsConflictMode);
+        const paragraphs = (resolved.snapshot.tab.paragraphs ?? []).filter(
+          (paragraph) =>
+            paragraph.endIndex > paragraphRange.startIndex &&
+            paragraph.startIndex < paragraphRange.endIndex,
+        );
+
+        if (nesting_levels && nesting_levels.length !== paragraphs.length) {
+          throw new Error(
+            `nesting_levels must contain one value per selected paragraph (${paragraphs.length}).`,
+          );
+        }
+        if (
+          preset === "NUMBERED" &&
+          nesting_levels &&
+          paragraphs.some((paragraph) => paragraph.displayText.length === 0)
+        ) {
+          throw new Error(
+            "Cannot guarantee native numbered-list continuity across a blank paragraph. Use paragraph spacing instead.",
+          );
+        }
+        if (continue_previous) {
+          if (preset === "REMOVE") {
+            throw new Error("continue_previous cannot be used with preset REMOVE.");
+          }
+          const firstIndex = (resolved.snapshot.tab.paragraphs ?? []).indexOf(paragraphs[0]);
+          const previous = firstIndex > 0
+            ? (resolved.snapshot.tab.paragraphs ?? [])[firstIndex - 1]
+            : undefined;
+          if (!previous?.list || previous.list.preset !== preset) {
+            throw new Error(
+              "Cannot continue numbering: the immediately preceding paragraph is not a compatible native list item.",
+            );
+          }
+        }
+
+        let result;
+        if (nesting_levels && preset !== "REMOVE") {
+          const totalTabs = nesting_levels.reduce((sum, level) => sum + level, 0);
+          const requests: docs_v1.Schema$Request[] = [
+            {
+              deleteParagraphBullets: {
+                range: { tabId: resolved.tabId, ...paragraphRange },
+              },
+            },
+            {
+              updateParagraphStyle: {
+                range: { tabId: resolved.tabId, ...paragraphRange },
+                paragraphStyle: {},
+                fields: "indentStart,indentFirstLine",
+              },
+            },
+            ...paragraphs
+              .map((paragraph, index) => ({ paragraph, level: nesting_levels[index] }))
+              .filter(({ level }) => level > 0)
+              .sort((left, right) => right.paragraph.startIndex - left.paragraph.startIndex)
+              .map(({ paragraph, level }) => ({
+                insertText: {
+                  location: { tabId: resolved.tabId, index: paragraph.startIndex },
+                  text: "\t".repeat(level),
+                },
+              })),
+            {
+              createParagraphBullets: {
+                range: {
+                  tabId: resolved.tabId,
+                  startIndex: paragraphRange.startIndex,
+                  endIndex: paragraphRange.endIndex + totalTabs,
+                },
+                bulletPreset: docBulletPreset(preset as Exclude<DocListPreset, "REMOVE">),
+              },
+            },
+          ];
+          result = await docsClient.batchUpdateRequests(
+            document_id,
+            requests,
+            revisionId,
+            conflict_mode as DocsConflictMode,
+            false,
+          );
+        } else {
+          result = await docsClient.updateList({
+            documentId: document_id,
+            tabId: resolved.tabId,
+            startIndex: paragraphRange.startIndex,
+            endIndex: paragraphRange.endIndex,
+            preset: preset as DocListPreset,
+            revisionId,
+            conflictMode: conflict_mode as DocsConflictMode,
+          });
+        }
         rememberDocumentRead(document_id, result.revisionId);
         return jsonResult({
           documentId: document_id,
@@ -2214,6 +3751,8 @@ export function createServer(
           revisionId: result.revisionId,
           paragraphRange,
           preset,
+          nestingLevels: nesting_levels,
+          continuedPrevious: continue_previous,
         });
       } catch (err) {
         return errorResult(err);

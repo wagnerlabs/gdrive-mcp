@@ -442,6 +442,11 @@ export class SheetsClient {
     const startRow = parseInt(match[4], 10) - 1;
     const endCol = match[5] ? colToIndex(match[5]) : startCol;
     const endRow = match[6] ? parseInt(match[6], 10) - 1 : startRow;
+    if (startRow < 0 || endRow < startRow || endCol < startCol) {
+      throw new DriveAPIError(
+        `Invalid range "${range}". The end cell must be at or below and to the right of the start cell.`,
+      );
+    }
     return { sheetTitle, startRow, startCol, endRow, endCol };
   }
 
